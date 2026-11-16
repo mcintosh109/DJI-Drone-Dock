@@ -91,9 +91,15 @@ if ! grep -q '^[[:space:]]*DELETE_FROM_DRONE[[:space:]]*=' "$CONF"; then
   if [ "$ANSWER" = y ]; then VALUE=yes; else VALUE=no; fi
   printf '\n# yes = delete photos/videos from the drone once their copy on the Pi is checked\nDELETE_FROM_DRONE=%s\n' "$VALUE" >> "$CONF"
 fi
-if ! grep -q '^[[:space:]]*CACHE_LIMIT_GB[[:space:]]*=' "$CONF"; then
-  printf '\n# The most the cache on the Pi may hold, in GB\nCACHE_LIMIT_GB=20\n' >> "$CONF"
-fi
+# add_setting NAME VALUE COMMENT: add NAME=VALUE if it isn't there yet
+add_setting() {
+  grep -q "^[[:space:]]*$1[[:space:]]*=" "$CONF" ||
+    printf '\n# %s\n%s=%s\n' "$3" "$1" "$2" >> "$CONF"
+}
+add_setting CACHE_LIMIT_GB 20 "The most the cache on the Pi may hold, in GB"
+add_setting KEEP_FREE_GB 5 "Always leave this much of the Pi's SD card free, in GB"
+add_setting REFILL_CHECK_MINUTES 5 "With the drone plugged in: how often to check if the cache has emptied, to refill it"
+add_setting REFILL_GIVE_UP_HOURS 12 "Stop waiting for the cache to empty after this many hours"
 
 echo
 echo "Checking the Immich settings..."

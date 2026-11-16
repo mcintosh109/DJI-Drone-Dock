@@ -105,7 +105,7 @@ cp "$T/bin/umount" "$T/bin/fusermount"
 # ---- The fake Immich -------------------------------------------------------------
 # A fake curl that answers like Immich. Assets are stored by checksum in
 # $T/immich/assets, albums in $T/immich/albums/<id>.name and <id>.list.
-# FAKE_IMMICH_DOWN: can't connect. Files named *BROKEN* are refused (400).
+# FAKE_IMMICH_DOWN (or the file $T/immich/down): can't connect. Files named *BROKEN* are refused (400).
 # FAKE_ALBUM_FAIL: adding to an album fails.
 cat > "$T/bin/curl" <<EOF
 #!/bin/bash
@@ -127,7 +127,7 @@ done
 hdr() { local h; for h in "\${hdrs[@]}"; do [[ \${h,,} == "\$1: "* ]] && echo "\${h#*: }"; done; }
 reply() { printf '%s' "\$2" > "\$out"; printf '%s' "\$1"; exit 0; }
 echo "\$method \$url" >> "\$I/requests"
-[ -n "\${FAKE_IMMICH_DOWN:-}" ] && { echo "curl: (7) Failed to connect" >&2; printf 000; exit 7; }
+{ [ -n "\${FAKE_IMMICH_DOWN:-}" ] || [ -e "\$I/down" ]; } && { echo "curl: (7) Failed to connect" >&2; printf 000; exit 7; }
 path=\${url#*/api}
 [ "\$path" = /server/ping ] && reply 200 '{"res":"pong"}'
 [ "\$(hdr x-api-key)" = "\$(cat "\$I/key")" ] || reply 401 '{"message":"Invalid API key","statusCode":401}'
@@ -170,7 +170,7 @@ echo "TESTKEY" > "$T/immich/key"
 export PATH="$T/bin:$PATH"
 export DJI_MNT="$T/mnt" DJI_STATE="$T/state" DJI_LOG="$T/sync.log" DJI_CONF="$T/immich.conf" \
        DJI_LOCK_DIR="$T" DJI_PROC_MOUNTS="$T/proc-mounts" DJI_DETECT_WAIT=0 DJI_RETRY_EVERY=1 \
-       DJI_FREE_KB=100000000 DJI_KEEP_FREE_MB=0
+       DJI_FREE_KB=100000000 DJI_KEEP_FREE_MB=0 DJI_REFILL_CHECK_SECONDS=1 DJI_REFILL_GIVE_UP_SECONDS=2
 
 write_conf() { printf 'IMMICH_URL=http://immich.test:2283/\nIMMICH_API_KEY="%s"\nIMMICH_ALBUM=%s\nDELETE_FROM_DRONE=%s\n' "${1:-TESTKEY}" "${2:-Drone Photos}" "${3:-no}" > "$T/immich.conf"; }
 # media STORAGE PATH-INSIDE-DCIM [content]: put a file on the fake MTP drone
@@ -513,6 +513,78 @@ echo "Check mode shows the drone settings"
 out=$(bash "$SYNC" --check)
 check "says files are deleted from the drone" grep -q "files ARE deleted from the drone" <<< "$out"
 check "  ...and the cache limit (20 GB by default)" grep -q "holds up to 20GB" <<< "$out"
+
+# ==== Refilling the cache while the drone stays plugged in =====================
+drone_files() { find "$T/mtp-drone/SD card/DCIM/$1" -type f 2>/dev/null | wc -l; }
+big_video() { mkdir -p "$T/mtp-drone/SD card/DCIM/$1"; head -c 600000 /dev/urandom > "$T/mtp-drone/SD card/DCIM/$1/$2"; }
+
+echo "More on the drone than fits: upload, refill, repeat until the drone is empty"
+big_video DJI_010 DJI_20260401100000_0100_D.MP4
+big_video DJI_010 DJI_20260401100100_0101_D.MP4
+big_video DJI_010 DJI_20260401100200_0102_D.MP4
+DJI_CACHE_LIMIT_MB=1 bash "$SYNC"; code=$?
+check "exit 0" [ "$code" -eq 0 ]
+check "all 3 videos were copied, one per round" grep -q "everything has been copied off the drone, in 3 rounds" "$T/sync.log"
+check "  ...and all deleted from the drone" [ "$(drone_files DJI_010)" -eq 0 ]
+check "  ...and all uploaded" bash -c "[ \$(grep -c 'uploaded: SD card/DJI_010/' '$T/sync.log') -eq 3 ]"
+check "the log says to keep the drone plugged in" grep -q "still on the drone - keep it plugged in" "$T/sync.log"
+check "'can be unplugged' comes only at the end" bash -c "grep 'everything has been copied off\|the drone can be unplugged' '$T/sync.log' | tail -2 | head -1 | grep -q everything"
+check "the drone was unmounted" nothing_mounted
+
+echo "Immich is down at first: waits, then refills once the cache empties"
+big_video DJI_011 DJI_20260402100000_0110_D.MP4
+big_video DJI_011 DJI_20260402100100_0111_D.MP4
+before=$(grep -c "can't reach Immich" "$T/sync.log")
+touch "$T/immich/down"
+( sleep 2.5; rm -f "$T/immich/down" ) &
+DJI_CACHE_LIMIT_MB=1 DJI_REFILL_GIVE_UP_SECONDS=30 bash "$SYNC"; code=$?
+wait
+check "exit 0" [ "$code" -eq 0 ]
+check "it waited, then refilled" grep -q "the cache has room again - refilling it from the drone (round 2)" "$T/sync.log"
+check "  ...and the drone is empty" [ "$(drone_files DJI_011)" -eq 0 ]
+check "Immich being down was logged once, not at every check" [ "$(grep -c "can't reach Immich" "$T/sync.log")" -eq $((before + 1)) ]
+
+echo "Immich stays down: gives up waiting, the rest stays on the drone"
+big_video DJI_012 DJI_20260403100000_0120_D.MP4
+big_video DJI_012 DJI_20260403100100_0121_D.MP4
+before=$(grep -c "can't reach Immich" "$T/sync.log")
+DJI_CACHE_LIMIT_MB=1 FAKE_IMMICH_DOWN=1 DJI_REFILL_GIVE_UP_SECONDS=3 bash "$SYNC"; code=$?
+check "exit 0 (nothing is lost)" [ "$code" -eq 0 ]
+check "the log says why it stopped" grep -q "stopped refilling: 1 file(s) (586KB) are still on the drone, because the cache on the Pi hasn't emptied" "$T/sync.log"
+check "  ...one video is in the cache, one still on the drone" bash -c "[ \$(drone_files() { find '$T/mtp-drone/SD card/DCIM/DJI_012' -type f | wc -l; }; drone_files) -eq 1 ]"
+check "'Immich is down' was logged once, not every check" [ "$(grep -c "can't reach Immich" "$T/sync.log")" -eq $((before + 1)) ]
+check "the drone was unmounted" nothing_mounted
+bash "$SYNC" --flush
+DJI_CACHE_LIMIT_MB=1 bash "$SYNC"
+check "the next dock copies the rest" [ "$(drone_files DJI_012)" -eq 0 ]
+
+echo "The drone is unplugged while waiting"
+big_video DJI_013 DJI_20260404100000_0130_D.MP4
+big_video DJI_013 DJI_20260404100100_0131_D.MP4
+(
+  # Like pulling the cable: the drone's folders vanish (marked "ro" so
+  # the fake doesn't copy the empty folder back onto the drone)
+  sleep 1.5
+  fake-writeback "$T/mnt"    # deletes on a real MTP drone happen straight away
+  awk -v mp="$T/mnt" '$2 == mp { $4 = "ro" } { print }' "$T/proc-mounts" > "$T/pm2.tmp"; mv "$T/pm2.tmp" "$T/proc-mounts"
+  find "$T/mnt" -mindepth 1 -delete
+) &
+DJI_CACHE_LIMIT_MB=1 FAKE_IMMICH_DOWN=1 DJI_REFILL_GIVE_UP_SECONDS=30 bash "$SYNC"; code=$?
+wait
+check "exit 0" [ "$code" -eq 0 ]
+check "the log says it was unplugged" grep -q "the drone was unplugged - 1 file(s) (586KB) are still on it" "$T/sync.log"
+check "  ...and the file not copied is still on the drone" [ "$(drone_files DJI_013)" -eq 1 ]
+bash "$SYNC" --flush
+DJI_CACHE_LIMIT_MB=1 bash "$SYNC"
+
+echo "A file too big for the cache, even when it's empty"
+mkdir -p "$T/mtp-drone/SD card/DCIM/DJI_014"
+head -c 1500000 /dev/urandom > "$T/mtp-drone/SD card/DCIM/DJI_014/DJI_20260405100000_0140_D.MP4"
+DJI_CACHE_LIMIT_MB=1 bash "$SYNC"; code=$?
+check "exit 0, without waiting" [ "$code" -eq 0 ]
+check "the log says it's too big" grep -q "because they're too big to fit in the cache on the Pi, even when it's empty" "$T/sync.log"
+check "  ...and it stays on the drone" [ "$(drone_files DJI_014)" -eq 1 ]
+rm -rf "$T/mtp-drone/SD card/DCIM/DJI_014"
 
 echo
 echo "$PASSED passed, $FAILED failed"

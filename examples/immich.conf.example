@@ -23,5 +23,21 @@ IMMICH_ALBUM=Drone Photos
 DELETE_FROM_DRONE=yes
 
 # The most the cache on the Pi may hold, in GB. Files that don't fit stay
-# on the drone and are copied the next time you plug it in.
+# on the drone until the cache has been uploaded and has room again (if
+# the drone is still plugged in), or until the next time you plug it in.
+# The Pi's SD card is 64 GB: the system takes about 3-8 GB, the RC 2
+# dock very little, so 20 GB leaves plenty of room.
 CACHE_LIMIT_GB=20
+
+# Always leave this much of the Pi's SD card free, in GB, for the system
+# and other programs (like the RC 2 dock's flight log cache).
+KEEP_FREE_GB=5
+
+# While the drone stays plugged in with files still on it (because the
+# cache was full): how often, in minutes, to check if the cache has been
+# uploaded and emptied, so it can be refilled from the drone.
+REFILL_CHECK_MINUTES=5
+
+# Stop waiting for the cache to empty after this many hours (e.g. if
+# Immich is down). The rest stays on the drone for the next plug-in.
+REFILL_GIVE_UP_HOURS=12

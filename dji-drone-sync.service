@@ -10,5 +10,6 @@ After=network-online.target
 Type=oneshot
 ExecStart=/usr/local/bin/dji-drone-sync.sh
 # Stop if it runs longer than this, e.g. a frozen USB connection.
-# Videos are big, so this is longer than the RC 2 dock's 30 minutes.
-TimeoutStartSec=4h
+# Long, because it keeps refilling the cache while the drone is plugged in
+# (it gives up by itself after REFILL_GIVE_UP_HOURS of no progress).
+TimeoutStartSec=24h

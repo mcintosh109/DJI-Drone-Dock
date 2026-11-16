@@ -36,10 +36,16 @@
 #   - Immich itself recognises files it already has (by their checksum),
 #     so nothing is ever uploaded twice
 #   - the cache holds at most CACHE_LIMIT_GB (default 20 GB), and it always
-#     leaves KEEP_FREE_MB free on the Pi, so big videos can't fill up the
+#     leaves KEEP_FREE_GB (default 5 GB) free on the Pi, for the system and
+#     other programs like the RC 2 dock, so big videos can't fill up the
 #     SD card; what didn't fit stays on the drone for a later dock
 #   - files are copied under a hidden name and renamed when complete, and
 #     hidden files are never uploaded, so half-copied files are never sent
+#   - while files are left on the drone because the cache was full, the
+#     drone stays mounted: the cache is uploaded, and every
+#     REFILL_CHECK_MINUTES it checks if the cache has emptied, then refills
+#     it, until the drone is empty (or it's unplugged, or it gives up after
+#     REFILL_GIVE_UP_HOURS)
 #   - the drone is always unmounted, even if something goes wrong
 #   - the Immich API key is never put on a command line (where any user
 #     of the Pi could see it with `ps`)
@@ -67,7 +73,7 @@ DETECT_WAIT=${DJI_DETECT_WAIT:-120}      # seconds to wait for the drone's stora
 RETRY_EVERY=${DJI_RETRY_EVERY:-10}       # seconds between tries while waiting
 VENDOR=${DJI_VENDOR:-2ca3}               # DJI's USB vendor ID
 SKIP_PRODUCTS=${DJI_SKIP_PRODUCTS:-1021} # USB product IDs to ignore (1021 = RC 2 controller)
-KEEP_FREE_MB=${DJI_KEEP_FREE_MB:-2048}   # always leave this much space free on the Pi
+KEEP_FREE_MB_OVERRIDE=${DJI_KEEP_FREE_MB:-}  # tests only: the space to keep free, in MB
 PROC_MOUNTS=${DJI_PROC_MOUNTS:-/proc/mounts}
 FREE_KB_OVERRIDE=${DJI_FREE_KB:-}        # tests only: pretend this much space is free
 CACHE_LIMIT_MB_OVERRIDE=${DJI_CACHE_LIMIT_MB:-}  # tests only: a cache limit smaller than 1 GB
@@ -121,6 +127,14 @@ safe_name() {
   n=$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')
   n=${n##.}            # no hidden folder names
   printf '%s' "$n"
+}
+
+# A time in seconds, written for people: e.g. 30 s, 5 min, 12 hour(s)
+human_time() {
+  if [ "$1" -ge 3600 ]; then echo "$(( $1 / 3600 )) hour(s)"
+  elif [ "$1" -ge 60 ]; then echo "$(( $1 / 60 )) min"
+  else echo "$1 s"
+  fi
 }
 
 # A size in bytes, written for people: e.g. 586KB, 1.2GB
@@ -258,11 +272,15 @@ api_message() {
   printf '%s' "$m"
 }
 
-# Log why uploads are waiting - once, not every 15 minutes. $1 is a short
+# Log why uploads are waiting, but not over and over: a dock says it once,
+# and the 15 minute upload only when the reason changes. $1 is a short
 # reason id, so a new reason is still logged.
+LOGGED_WAIT=""
 waiting() {
-  if [ "$MODE" != flush ] || [ "$(cat "$WAITING_FLAG" 2>/dev/null)" != "$1" ]; then
+  if [ "$LOGGED_WAIT" != "$1" ] &&
+     { [ "$MODE" != flush ] || [ "$(cat "$WAITING_FLAG" 2>/dev/null)" != "$1" ]; }; then
     log "$2"
+    LOGGED_WAIT=$1
   fi
   [ "$MODE" = check ] || echo "$1" > "$WAITING_FLAG"
 }
@@ -332,16 +350,33 @@ connect_immich() {
 #   DELETE_FROM_DRONE  yes = delete each file from the drone once its copy on
 #                      the Pi is checked. Anything else, or missing = never.
 #   CACHE_LIMIT_GB     the most the cache on the Pi may hold (default 20)
+#   KEEP_FREE_GB       always leave this much of the Pi's SD card free, for
+#                      the system and other programs (default 5)
+#   REFILL_CHECK_MINUTES  while the drone stays plugged in with files left
+#                      on it, how often to check if the cache has emptied
+#                      so it can be refilled (default 5)
+#   REFILL_GIVE_UP_HOURS  stop waiting if the cache hasn't emptied after
+#                      this long, e.g. because Immich is down (default 12)
+# whole_number NAME DEFAULT: a setting that must be a whole number above 0
+whole_number() {
+  local v; v=$(conf_get "$1")
+  if ! [[ $v =~ ^[0-9]+$ ]] || [ "$v" -eq 0 ]; then
+    [ -n "$v" ] && log "$1=$v isn't a whole number - using $2"
+    v=$2
+  fi
+  echo "$v"
+}
 read_dock_settings() {
   case "$(conf_get DELETE_FROM_DRONE)" in
     yes|Yes|YES|true|on|1) DELETE_FROM_DRONE=yes ;;
     *) DELETE_FROM_DRONE=no ;;
   esac
-  local gb; gb=$(conf_get CACHE_LIMIT_GB)
-  if ! [[ $gb =~ ^[0-9]+$ ]] || [ "$gb" -eq 0 ]; then
-    [ -n "$gb" ] && log "CACHE_LIMIT_GB=$gb isn't a whole number of GB - using 20"
-    gb=20
+  local gb; gb=$(whole_number CACHE_LIMIT_GB 20)
+  if [ -n "$KEEP_FREE_MB_OVERRIDE" ]; then KEEP_FREE=$(( KEEP_FREE_MB_OVERRIDE * 1024 * 1024 ))
+  else KEEP_FREE=$(( $(whole_number KEEP_FREE_GB 5) * 1024 * 1024 * 1024 ))
   fi
+  REFILL_CHECK=${DJI_REFILL_CHECK_SECONDS:-$(( $(whole_number REFILL_CHECK_MINUTES 5) * 60 ))}
+  REFILL_GIVE_UP=${DJI_REFILL_GIVE_UP_SECONDS:-$(( $(whole_number REFILL_GIVE_UP_HOURS 12) * 3600 ))}
   if [ -n "$CACHE_LIMIT_MB_OVERRIDE" ]; then CACHE_LIMIT=$(( CACHE_LIMIT_MB_OVERRIDE * 1024 * 1024 ))
   else CACHE_LIMIT=$(( gb * 1024 * 1024 * 1024 ))
   fi
@@ -434,6 +469,7 @@ if [ "$MODE" = check ]; then
   fi
   read_dock_settings
   echo "     the cache on the Pi holds up to $(human "$CACHE_LIMIT"); $(cached_count) file(s) are waiting in it"
+  echo "     $(human "$KEEP_FREE") of the Pi is always kept free; free right now: $(df -Ph "$STATE" 2>/dev/null | awk 'NR == 2 { print $4 }')"
   if [ "$DELETE_FROM_DRONE" = yes ]; then
     echo "     files ARE deleted from the drone once they're copied to the Pi (DELETE_FROM_DRONE=yes)"
   else
@@ -469,7 +505,220 @@ touch "$IMPORTED"
 COPY_FAILED=0
 read_dock_settings
 
-# ==== Dock mode: drone -> cache =================================================
+# ==== Copying from the drone =====================================================
+
+# One round of copying: copy what fits from the drone into the cache, then,
+# with DELETE_FROM_DRONE=yes, delete from the drone what was checked.
+# Sets NEW / NEW_BYTES (copied), NO_ROOM / NO_ROOM_BYTES (didn't fit, still
+# on the drone) and CACHE_USED (what was in the cache before this round).
+copy_round() {
+  local size a b key free_kb dcim storage i=0 want rel st
+
+  # Files already in Immich are remembered as "size<TAB>checksum<TAB>path",
+  # so they aren't copied again. The size is included so that a new photo
+  # that happens to reuse an old name (e.g. after formatting the card) is
+  # still copied. CONFIRMED holds the checksum Immich confirmed for each.
+  # Read again every round, because uploads in between add to it.
+  declare -gA IN_IMMICH=() CONFIRMED=()
+  while IFS=$'\t' read -r size a b; do
+    key=${b:-$a}    # older lines have no checksum: "size<TAB>path"
+    [ -n "$key" ] && IN_IMMICH["$size"$'\t'"$key"]=1
+    [ -n "$b" ] && CONFIRMED["$size"$'\t'"$b"]=$a
+  done < "$IMPORTED"
+
+  # How much may be copied: whichever is smaller of
+  #   - the room left in the cache: CACHE_LIMIT minus what's already in it
+  #   - the free space on the Pi right now, minus KEEP_FREE_GB. This is
+  #     measured every round, so the system, the RC 2 dock and the logs
+  #     are always counted, whatever they're using.
+  if [ -n "$FREE_KB_OVERRIDE" ]; then free_kb=$FREE_KB_OVERRIDE
+  else free_kb=$(df -Pk "$CACHE" | awk 'NR == 2 { print $4 }')
+  fi
+  local disk_room=$(( free_kb * 1024 - KEEP_FREE ))
+  CACHE_USED=$(find "$CACHE" -type f -printf '%s\n' | awk '{ s += $1 } END { print s + 0 }')
+  local cache_room=$(( CACHE_LIMIT - CACHE_USED ))
+  local budget=$(( cache_room < disk_room ? cache_room : disk_room ))
+
+  NEW=0; NEW_BYTES=0; NO_ROOM=0; NO_ROOM_BYTES=0
+  for dcim in "${DCIMS[@]}"; do
+    storage=$(storage_of "$dcim")
+    i=$((i + 1))
+    want=$TMP/want-$i
+    : > "$want"
+    while IFS=$'\t' read -r size rel; do
+      case "/$rel" in */.*) continue ;; esac     # hidden files and folders
+      is_media "$rel" || continue
+      key="$storage/$rel"
+      [ -n "${IN_IMMICH["$size"$'\t'"$key"]+x}" ] && continue   # already in Immich
+      if [ -e "$CACHE/$key" ]; then
+        # Already waiting in the cache. A different file with the same
+        # name is left on the drone for now, so the waiting one isn't replaced.
+        if [ "$(stat -c %s "$CACHE/$key")" != "$size" ]; then
+          log "not copied yet: a different file with the same name is waiting in the cache: $key"
+        fi
+        continue
+      fi
+      if [ "$size" -gt "$budget" ]; then
+        NO_ROOM=$((NO_ROOM + 1)); NO_ROOM_BYTES=$((NO_ROOM_BYTES + size))
+        continue
+      fi
+      budget=$((budget - size))
+      NEW=$((NEW + 1)); NEW_BYTES=$((NEW_BYTES + size))
+      printf '%s\n' "$rel" >> "$want"
+    done < <(find "$dcim" -type f -printf '%s\t%P\n' 2>> "$LOG" | sort -t $'\t' -k 2)
+
+    if [ -s "$want" ]; then
+      mkdir -p "$CACHE/$storage"
+      # rsync copies just the listed files, writing each one under a hidden
+      # temporary name and renaming it when done. -t keeps each file's date.
+      rsync -t --ignore-existing --files-from="$want" "$dcim"/ "$CACHE/$storage"/ 2>> "$LOG" || {
+        st=$?
+        log "copy from the drone failed ($storage, rsync exit code $st) - files fully copied before the error are kept"
+        COPY_FAILED=1
+      }
+    fi
+  done
+  if [ "$NEW" -eq 0 ] && [ "$NO_ROOM" -eq 0 ]; then
+    log "no new photos or videos on the drone"
+  elif [ "$NEW" -gt 0 ]; then
+    log "copied $NEW new photo(s)/video(s) from the drone ($(human "$NEW_BYTES"))"
+  fi
+  if [ "$NO_ROOM" -gt 0 ]; then
+    log "$NO_ROOM file(s) ($(human "$NO_ROOM_BYTES")) didn't fit in the cache on the Pi (it holds up to $(human "$CACHE_LIMIT"), and keeps $(human "$KEEP_FREE") of the Pi free for everything else) - they stay on the drone for now"
+  fi
+
+  # Free up the drone: delete what is now safely on the Pi (or in Immich)
+  if [ "$DELETE_FROM_DRONE" = yes ]; then
+    DELETED=0; DELETED_BYTES=0
+    for dcim in "${DCIMS[@]}"; do
+      delete_from_drone "$dcim" || COPY_FAILED=1
+    done
+    [ "$DELETED" -gt 0 ] && log "deleted $DELETED photo(s)/video(s) from the drone ($(human "$DELETED_BYTES") freed) - they're on the Pi, waiting for Immich"
+  fi
+  return 0
+}
+
+# True while the drone is still plugged in: every DCIM folder can be read.
+drone_still_there() {
+  local d
+  for d in "${DCIMS[@]}"; do ls "$d" > /dev/null 2>&1 || return 1; done
+}
+
+# ==== Cache -> Immich ==============================================================
+
+# upload_cache [nowait]
+# Uploads the cache to Immich. Returns 0 = finished, 1 = errors,
+# 2 = nothing done (nothing waiting, Immich not ready, or another upload
+# running: the files wait). With "nowait" it doesn't wait for another
+# upload that's running. UPLOAD_DONE_ALL is "yes" if it got through every
+# file it could (Immich was reachable the whole time).
+upload_cache() {
+  local result
+  upload_cache_now "${1:-}"; result=$?
+  flock -u 9    # let the 15 minute upload run again
+  return "$result"
+}
+upload_cache_now() {
+  local count status code f key size sum when esc id ok
+  UPLOAD_DONE_ALL=no
+  if [ "$MODE" = dock ] && [ "$1" != nowait ]; then
+    if ! flock -w "$LOCK_WAIT" 9; then
+      log "an upload is already running - the new files will be uploaded within 15 minutes"
+      return 2
+    fi
+  else
+    # Skip this turn if another upload is running
+    flock -n 9 || return 2
+  fi
+
+  count=$(cached_count)
+  if [ "$count" -eq 0 ]; then
+    [ "$MODE" = dock ] && [ "$REFILLING" = no ] && log "nothing waiting to upload"
+    return 2
+  fi
+
+  connect_immich; status=$?
+  [ "$status" -eq 2 ] && return 2   # files wait in the cache
+  [ "$status" -ne 0 ] && return 1
+
+  if [ -e "$WAITING_FLAG" ]; then
+    log "Immich is ready again - uploading $count file(s) from the cache"
+    rm -f "$WAITING_FLAG"
+  fi
+  log "uploading $count file(s) to the Immich album \"$ALBUM\"..."
+
+  UPLOADED=0; DUPES=0; FAILED=0; UPLOAD_DONE_ALL=yes
+  # The list of files is read on file descriptor 3, so curl can't swallow it
+  while IFS= read -r -d '' f <&3; do
+    key=${f#"$CACHE"/}
+    size=$(stat -c %s "$f")
+    # The checksum lets Immich spot a file it already has before it's sent
+    sum=$(sha1sum "$f" | cut -d ' ' -f 1)
+    when=$(date -u -r "$f" +%Y-%m-%dT%H:%M:%S.000Z)
+    # curl needs " and \ in the file's path escaped inside the quotes
+    esc=${f//\\/\\\\}; esc=${esc//\"/\\\"}
+
+    # Immich reads the real date and GPS position from the photo itself;
+    # the file's date is only a fallback. deviceAssetId and deviceId are
+    # needed by older versions of Immich, and ignored by newer ones.
+    # --speed-time/--speed-limit give up if nothing is sent for 2 minutes.
+    code=$(api POST /assets -H "x-immich-checksum: $sum" \
+      -F "assetData=@\"$esc\"" \
+      --form-string "deviceAssetId=$key-$size" \
+      --form-string "deviceId=$DEVICE_ID" \
+      --form-string "fileCreatedAt=$when" \
+      --form-string "fileModifiedAt=$when" \
+      --form-string "filename=$(basename "$f")" \
+      --speed-time 120 --speed-limit 1)
+
+    case "$code" in
+      200|201) ;;
+      000)
+        log "lost the connection to Immich ($(api_message)) - the rest stay in the cache and are retried within 15 minutes"
+        FAILED=$((FAILED + 1)); UPLOAD_DONE_ALL=no; break ;;
+      401|403)
+        log "Immich refused the upload (HTTP $code: $(api_message)) - check the API key and its permissions"
+        FAILED=$((FAILED + 1)); UPLOAD_DONE_ALL=no; break ;;
+      *)
+        log "Immich didn't accept $key (HTTP $code: $(api_message)) - kept in the cache"
+        FAILED=$((FAILED + 1)); continue ;;
+    esac
+    status=$(jq -r '.status // empty' "$RESP" 2>/dev/null)
+    id=$(jq -r '.id // empty' "$RESP" 2>/dev/null)
+    if ! [[ $id =~ ^[A-Za-z0-9-]+$ ]]; then
+      log "Immich's reply for $key had no asset ID - kept in the cache"
+      FAILED=$((FAILED + 1)); continue
+    fi
+
+    # Put it in the album. "duplicate" here means it was already in the album.
+    code=$(api PUT "/albums/$ALBUM_ID/assets" --max-time 60 \
+      -H 'Content-Type: application/json' -d "$(jq -cn --arg id "$id" '{ids: [$id]}')")
+    ok=$(jq -r '.[0] | (.success == true or .error == "duplicate")' "$RESP" 2>/dev/null)
+    if [ "$code" != 200 ] || [ "$ok" != true ]; then
+      log "uploaded $key, but could not add it to the album (HTTP $code: $(api_message)) - kept in the cache, retried later"
+      FAILED=$((FAILED + 1)); continue
+    fi
+
+    # Confirmed: remember it (with its checksum), then remove it from the cache
+    printf '%s\t%s\t%s\n' "$size" "$sum" "$key" >> "$IMPORTED"
+    rm -f "$f"
+    if [ "$status" = duplicate ]; then
+      DUPES=$((DUPES + 1))
+      log "already in Immich (added to the album): $key"
+    else
+      UPLOADED=$((UPLOADED + 1))
+      log "uploaded: $key"
+    fi
+  done 3< <(find "$CACHE" -type f -not -name '.*' -print0 | sort -z)
+  find "$CACHE" -mindepth 1 -type d -empty -delete 2>/dev/null
+
+  log "Immich: $UPLOADED uploaded, $DUPES were already there, $(cached_count) left in the cache"
+  [ "$FAILED" -eq 0 ]
+}
+
+# ==== Dock mode ====================================================================
+REFILLING=no         # "yes" while waiting for the cache to empty, to refill it
+UPLOAD_STATUS=2
 if [ "$MODE" = dock ]; then
   if ! flock -w "$LOCK_WAIT" 8; then
     log "another copy from a drone is already running - skipped"
@@ -507,83 +756,56 @@ if [ "$MODE" = dock ]; then
     WAITED=$((WAITED + RETRY_EVERY))
   done
 
-  # Files already in Immich are remembered as "size<TAB>checksum<TAB>path",
-  # so they aren't copied again. The size is included so that a new photo
-  # that happens to reuse an old name (e.g. after formatting the card) is
-  # still copied. CONFIRMED holds the checksum Immich confirmed for each.
-  declare -A IN_IMMICH=() CONFIRMED=()
-  while IFS=$'\t' read -r size a b; do
-    key=${b:-$a}    # older lines have no checksum: "size<TAB>path"
-    [ -n "$key" ] && IN_IMMICH["$size"$'\t'"$key"]=1
-    [ -n "$b" ] && CONFIRMED["$size"$'\t'"$b"]=$a
-  done < "$IMPORTED"
+  ROUND=1
+  copy_round
 
-  # How much may be copied: whichever is smaller of
-  #   - the room left in the cache: CACHE_LIMIT minus what's already in it
-  #   - the free space on the Pi, minus KEEP_FREE_MB
-  if [ -n "$FREE_KB_OVERRIDE" ]; then free_kb=$FREE_KB_OVERRIDE
-  else free_kb=$(df -Pk "$CACHE" | awk 'NR == 2 { print $4 }')
-  fi
-  DISK_ROOM=$(( free_kb * 1024 - KEEP_FREE_MB * 1024 * 1024 ))
-  CACHE_USED=$(find "$CACHE" -type f -printf '%s\n' | awk '{ s += $1 } END { print s + 0 }')
-  CACHE_ROOM=$(( CACHE_LIMIT - CACHE_USED ))
-  BUDGET=$(( CACHE_ROOM < DISK_ROOM ? CACHE_ROOM : DISK_ROOM ))
-
-  NEW=0; NEW_BYTES=0; NO_ROOM=0; NO_ROOM_BYTES=0; i=0
-  for dcim in "${DCIMS[@]}"; do
-    storage=$(storage_of "$dcim")
-    i=$((i + 1))
-    want=$TMP/want-$i
-    : > "$want"
-    while IFS=$'\t' read -r size rel; do
-      case "/$rel" in */.*) continue ;; esac     # hidden files and folders
-      is_media "$rel" || continue
-      key="$storage/$rel"
-      [ -n "${IN_IMMICH["$size"$'\t'"$key"]+x}" ] && continue   # already in Immich
-      if [ -e "$CACHE/$key" ]; then
-        # Already waiting in the cache. A different file with the same
-        # name is left on the drone for now, so the waiting one isn't replaced.
-        if [ "$(stat -c %s "$CACHE/$key")" != "$size" ]; then
-          log "not copied yet: a different file with the same name is waiting in the cache: $key"
-        fi
-        continue
+  # ---- Refill: while files are still left on the drone because the cache
+  # was full, upload the cache, wait for it to empty, and copy more.
+  # Stops when the drone is empty, the drone is unplugged, nothing more
+  # can be copied, or the cache hasn't emptied for REFILL_GIVE_UP seconds.
+  REFILLING=yes
+  STOP_REASON=""
+  while [ "$NO_ROOM" -gt 0 ]; do
+    if [ "$NEW" -eq 0 ] && { [ "$ROUND" -gt 1 ] || [ "$CACHE_USED" -eq 0 ]; }; then
+      if [ "$(cached_count)" -eq 0 ]; then
+        STOP_REASON="they're too big to fit in the cache on the Pi, even when it's empty (raise CACHE_LIMIT_GB, or free up space on the Pi)"
+      else
+        STOP_REASON="the cache is still full of files Immich didn't accept (see above)"
       fi
-      if [ "$size" -gt "$BUDGET" ]; then
-        NO_ROOM=$((NO_ROOM + 1)); NO_ROOM_BYTES=$((NO_ROOM_BYTES + size))
-        continue
-      fi
-      BUDGET=$((BUDGET - size))
-      NEW=$((NEW + 1)); NEW_BYTES=$((NEW_BYTES + size))
-      printf '%s\n' "$rel" >> "$want"
-    done < <(find "$dcim" -type f -printf '%s\t%P\n' 2>> "$LOG" | sort -t $'\t' -k 2)
-
-    if [ -s "$want" ]; then
-      mkdir -p "$CACHE/$storage"
-      # rsync copies just the listed files, writing each one under a hidden
-      # temporary name and renaming it when done. -t keeps each file's date.
-      rsync -t --ignore-existing --files-from="$want" "$dcim"/ "$CACHE/$storage"/ 2>> "$LOG" || {
-        st=$?
-        log "copy from the drone failed ($storage, rsync exit code $st) - files fully copied before the error are kept"
-        COPY_FAILED=1
-      }
+      break
     fi
-  done
-  if [ "$NEW" -eq 0 ] && [ "$NO_ROOM" -eq 0 ]; then
-    log "no new photos or videos on the drone"
-  else
-    log "copied $NEW new photo(s)/video(s) from the drone ($(human "$NEW_BYTES"))"
-  fi
-  if [ "$NO_ROOM" -gt 0 ]; then
-    log "$NO_ROOM file(s) ($(human "$NO_ROOM_BYTES")) didn't fit in the cache on the Pi (it holds up to $(human "$CACHE_LIMIT"), and keeps ${KEEP_FREE_MB} MB of the Pi free) - they stay on the drone; dock it again after the upload to copy them"
-  fi
+    log "round $ROUND done: $NO_ROOM file(s) ($(human "$NO_ROOM_BYTES")) still on the drone - keep it plugged in; uploading the cache, then refilling it (checking every $(human_time "$REFILL_CHECK"))"
+    upload_cache nowait; [ "$?" -eq 1 ] && UPLOAD_STATUS=1
 
-  # Free up the drone: delete what is now safely on the Pi (or in Immich)
-  if [ "$DELETE_FROM_DRONE" = yes ]; then
-    DELETED=0; DELETED_BYTES=0
-    for dcim in "${DCIMS[@]}"; do
-      delete_from_drone "$dcim" || COPY_FAILED=1
+    # Wait until the cache is empty (or the upload got through everything
+    # it could - a file Immich refuses would otherwise never let it empty)
+    WAITED=0
+    while [ "$(cached_count)" -gt 0 ] && [ "$UPLOAD_DONE_ALL" != yes ]; do
+      if ! drone_still_there; then break 2; fi
+      if [ "$WAITED" -ge "$REFILL_GIVE_UP" ]; then
+        STOP_REASON="the cache on the Pi hasn't emptied for $(human_time "$REFILL_GIVE_UP") - is Immich down, or not set up yet?"
+        break 2
+      fi
+      sleep "$REFILL_CHECK"
+      WAITED=$((WAITED + REFILL_CHECK))
+      upload_cache nowait; [ "$?" -eq 1 ] && UPLOAD_STATUS=1
     done
-    [ "$DELETED" -gt 0 ] && log "deleted $DELETED photo(s)/video(s) from the drone ($(human "$DELETED_BYTES") freed) - they're on the Pi, waiting for Immich"
+    if ! drone_still_there; then break; fi
+
+    ROUND=$((ROUND + 1))
+    log "the cache has room again - refilling it from the drone (round $ROUND)"
+    copy_round
+  done
+  REFILLING=no
+
+  if [ "$NO_ROOM" -gt 0 ]; then
+    if ! drone_still_there; then
+      log "the drone was unplugged - $NO_ROOM file(s) ($(human "$NO_ROOM_BYTES")) are still on it; plug it in again to copy them"
+    else
+      log "stopped refilling: $NO_ROOM file(s) ($(human "$NO_ROOM_BYTES")) are still on the drone, because $STOP_REASON"
+    fi
+  elif [ "$ROUND" -gt 1 ]; then
+    log "everything has been copied off the drone, in $ROUND rounds"
   fi
 
   unmount_all   # finished with the drone: it can be unplugged now
@@ -596,100 +818,15 @@ else
   [ "$(cached_count)" -eq 0 ] && exit 0
 fi
 
-# ==== Cache -> Immich =================================================================
+# ---- Upload what's left in the cache --------------------------------------------
 if [ "$MODE" = dock ]; then
-  if ! flock -w "$LOCK_WAIT" 9; then
-    log "an upload is already running - the new files will be uploaded within 15 minutes"
-    exit "$COPY_FAILED"
-  fi
+  upload_cache; [ "$?" -eq 1 ] && UPLOAD_STATUS=1
 else
-  # A flush simply skips its turn if an upload is running
-  flock -n 9 || exit 0
+  upload_cache nowait; UPLOAD_STATUS=$?
+  [ "$UPLOAD_STATUS" -eq 2 ] && exit 0   # nothing done: quiet
 fi
 
-COUNT=$(cached_count)
-if [ "$COUNT" -eq 0 ]; then
-  [ "$MODE" = dock ] && log "nothing waiting to upload"
-  exit "$COPY_FAILED"
-fi
-
-connect_immich; status=$?
-if [ "$status" -eq 2 ]; then exit "$COPY_FAILED"; fi   # files wait in the cache
-if [ "$status" -ne 0 ]; then exit 1; fi
-
-if [ -e "$WAITING_FLAG" ]; then
-  log "Immich is ready again - uploading $COUNT file(s) from the cache"
-  rm -f "$WAITING_FLAG"
-fi
-log "uploading $COUNT file(s) to the Immich album \"$ALBUM\"..."
-
-UPLOADED=0; DUPES=0; FAILED=0
-# The list of files is read on file descriptor 3, so curl can't swallow it
-while IFS= read -r -d '' f <&3; do
-  key=${f#"$CACHE"/}
-  size=$(stat -c %s "$f")
-  # The checksum lets Immich spot a file it already has before it's sent
-  sum=$(sha1sum "$f" | cut -d ' ' -f 1)
-  when=$(date -u -r "$f" +%Y-%m-%dT%H:%M:%S.000Z)
-  # curl needs " and \ in the file's path escaped inside the quotes
-  esc=${f//\\/\\\\}; esc=${esc//\"/\\\"}
-
-  # Immich reads the real date and GPS position from the photo itself;
-  # the file's date is only a fallback. deviceAssetId and deviceId are
-  # needed by older versions of Immich, and ignored by newer ones.
-  # --speed-time/--speed-limit give up if nothing is sent for 2 minutes.
-  code=$(api POST /assets -H "x-immich-checksum: $sum" \
-    -F "assetData=@\"$esc\"" \
-    --form-string "deviceAssetId=$key-$size" \
-    --form-string "deviceId=$DEVICE_ID" \
-    --form-string "fileCreatedAt=$when" \
-    --form-string "fileModifiedAt=$when" \
-    --form-string "filename=$(basename "$f")" \
-    --speed-time 120 --speed-limit 1)
-
-  case "$code" in
-    200|201) ;;
-    000)
-      log "lost the connection to Immich ($(api_message)) - the rest stay in the cache and are retried within 15 minutes"
-      FAILED=$((FAILED + 1)); break ;;
-    401|403)
-      log "Immich refused the upload (HTTP $code: $(api_message)) - check the API key and its permissions"
-      FAILED=$((FAILED + 1)); break ;;
-    *)
-      log "Immich didn't accept $key (HTTP $code: $(api_message)) - kept in the cache"
-      FAILED=$((FAILED + 1)); continue ;;
-  esac
-  status=$(jq -r '.status // empty' "$RESP" 2>/dev/null)
-  id=$(jq -r '.id // empty' "$RESP" 2>/dev/null)
-  if ! [[ $id =~ ^[A-Za-z0-9-]+$ ]]; then
-    log "Immich's reply for $key had no asset ID - kept in the cache"
-    FAILED=$((FAILED + 1)); continue
-  fi
-
-  # Put it in the album. "duplicate" here means it was already in the album.
-  code=$(api PUT "/albums/$ALBUM_ID/assets" --max-time 60 \
-    -H 'Content-Type: application/json' -d "$(jq -cn --arg id "$id" '{ids: [$id]}')")
-  ok=$(jq -r '.[0] | (.success == true or .error == "duplicate")' "$RESP" 2>/dev/null)
-  if [ "$code" != 200 ] || [ "$ok" != true ]; then
-    log "uploaded $key, but could not add it to the album (HTTP $code: $(api_message)) - kept in the cache, retried later"
-    FAILED=$((FAILED + 1)); continue
-  fi
-
-  # Confirmed: remember it, then remove it from the cache
-  printf '%s\t%s\t%s\n' "$size" "$sum" "$key" >> "$IMPORTED"
-  rm -f "$f"
-  if [ "$status" = duplicate ]; then
-    DUPES=$((DUPES + 1))
-    log "already in Immich (added to the album): $key"
-  else
-    UPLOADED=$((UPLOADED + 1))
-    log "uploaded: $key"
-  fi
-done 3< <(find "$CACHE" -type f -not -name '.*' -print0 | sort -z)
-find "$CACHE" -mindepth 1 -type d -empty -delete 2>/dev/null
-
-log "Immich: $UPLOADED uploaded, $DUPES were already there, $(cached_count) left in the cache"
-if [ "$COPY_FAILED" -ne 0 ] || [ "$FAILED" -ne 0 ]; then
+if [ "$COPY_FAILED" -ne 0 ] || [ "$UPLOAD_STATUS" -eq 1 ]; then
   log "done, with errors (see above)"
   exit 1
 fi

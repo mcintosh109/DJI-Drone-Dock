@@ -15,9 +15,10 @@ It's the photo version of [dji-rc2-dock](https://github.com/mcintosh109/dji-rc2-
    - as an **MTP device**, like a phone or the RC 2 controller. It's mounted with `jmtpfs`, and only read from.
 4. It copies new photos and videos from every `DCIM` folder into a **cache on the Pi's SD card** (`/var/lib/dji-drone/cache`). The cache holds at most **20 GB**.
 5. It **checks each copy byte for byte** against the file on the drone (with `cmp`). Only if they're identical is the file **deleted from the drone**. (You can turn deleting off, see "Deleting from the drone".)
-6. It unmounts the drone, and the log says `the drone can be unplugged`. The drone's storage is now free.
-7. It uploads the cache to Immich and adds each file to the album. Each cached file is deleted from the Pi only after Immich confirms it has it **and** it's in the album.
-8. If Immich is down (or not set up yet), the files wait in the cache. A timer (`dji-drone-flush.timer`) checks every 15 minutes and uploads them as soon as Immich is back, without plugging the drone in again.
+6. **If files are still on the drone** because the cache was full, the drone stays plugged in and the dock **refills** (see "Refilling the cache"): it uploads the cache, checks every 5 minutes if the cache has emptied, then copies the next batch. This repeats until the drone is empty.
+7. It unmounts the drone, and the log says `the drone can be unplugged`. The drone's storage is now free.
+8. It uploads what's left in the cache to Immich and adds each file to the album. Each cached file is deleted from the Pi only after Immich confirms it has it **and** it's in the album.
+9. If Immich is down (or not set up yet), the files wait in the cache. A timer (`dji-drone-flush.timer`) checks every 15 minutes and uploads them as soon as Immich is back, without plugging the drone in again.
 
 ### Deleting from the drone
 
@@ -35,9 +36,44 @@ Also deleted: a video's `.LRF` file (a small preview, no use without the video).
 
 ### The 20 GB cache limit
 
-The cache on the Pi holds at most 20 GB, counting what's already waiting in it. Change it with the `CACHE_LIMIT_GB` setting. The Pi also always keeps 2 GB of its own space free.
+The cache on the Pi holds at most 20 GB, counting what's already waiting in it. Change it with the `CACHE_LIMIT_GB` setting.
 
-For example, with 30 GB of new videos on the drone: 20 GB is copied and deleted from the drone, and 10 GB stays on the drone. Once the 20 GB is uploaded to Immich, plug the drone in again to copy the rest.
+The Pi also always keeps **5 GB of its SD card free** for everything else (the system, the RC 2 dock, logs). Change it with `KEEP_FREE_GB`. Each batch copies whichever is smaller: the room left in the cache, or the Pi's free space right now minus that 5 GB. The free space is measured fresh before every batch, so whatever the system and the RC 2 dock are using is always counted.
+
+### Refilling the cache
+
+When the drone has more on it than fits in the cache, you don't need to unplug and plug it in again. Leave it plugged in and the dock does this by itself:
+
+1. Copies a batch (up to 20 GB) and deletes it from the drone.
+2. Uploads the cache to Immich.
+3. Every 5 minutes (`REFILL_CHECK_MINUTES`), checks if the cache has emptied.
+4. Once it has, copies the next batch, and so on, until the drone is empty.
+
+For example, with 50 GB on the drone: batch 1 is 20 GB, batch 2 is 20 GB, batch 3 is 10 GB. The log says `round 1 done`, `refilling it from the drone (round 2)`, and at the end `everything has been copied off the drone, in 3 rounds`, then `the drone can be unplugged`.
+
+It stops refilling, and the rest stays safely on the drone, if:
+- you unplug the drone (plug it in again later to carry on),
+- the cache hasn't emptied for 12 hours (`REFILL_GIVE_UP_HOURS`), for example because Immich is down or not set up yet,
+- a single file is too big for the cache even when it's empty.
+
+**While Immich isn't set up yet,** the cache can't empty by itself. You can empty it yourself by copying the files somewhere else and then deleting them from `/var/lib/dji-drone/cache`. If the drone is still plugged in, the dock notices within 5 minutes and refills.
+
+### Storage on a 64 GB Pi
+
+A rough budget for a Pi with a 64 GB SD card that also runs the RC 2 dock:
+
+| What | Space |
+|---|---|
+| A "64 GB" SD card, usable | about 58 GB |
+| Raspberry Pi OS (Lite about 3 GB, with desktop about 8 GB) | 3 - 8 GB |
+| RC 2 dock (flight logs are a few MB each) | well under 1 GB |
+| Drone cache, at most (`CACHE_LIMIT_GB`) | 20 GB |
+| Always kept free (`KEEP_FREE_GB`) | 5 GB |
+| **Left over** | **about 25 - 30 GB** |
+
+So 20 GB is safe. Check the real numbers on your Pi with `df -h /` (the "Avail" column is the free space) and `sudo dji-drone-sync.sh --check`.
+
+SD cards wear out with lots of writing, and this dock writes a lot (every photo and video passes through the cache). A **"high endurance"** card, made for dashcams and security cameras, lasts much longer.
 
 ### Which files are copied
 
@@ -51,7 +87,7 @@ For example, with 30 GB of new videos on the drone: 20 GB is copied and deleted 
 - Raspberry Pi (64-bit Raspberry Pi OS Lite is best, see Troubleshooting)
 - Official Pi power supply (low power causes unreliable copies)
 - A USB-C cable that carries **data**, not just charge
-- A good-quality SD card in the Pi with at least 32 GB, so the 20 GB cache fits with room to spare. (Or lower `CACHE_LIMIT_GB`.)
+- A good-quality SD card in the Pi, ideally "high endurance". 64 GB is plenty: see "Storage on a 64 GB Pi".
 
 ## Install
 
@@ -103,7 +139,19 @@ IMMICH_API_KEY=your-key-here
 IMMICH_ALBUM=Drone Photos
 DELETE_FROM_DRONE=yes
 CACHE_LIMIT_GB=20
+KEEP_FREE_GB=5
+REFILL_CHECK_MINUTES=5
+REFILL_GIVE_UP_HOURS=12
 ```
+
+| Setting | What it does |
+|---|---|
+| `IMMICH_URL`, `IMMICH_API_KEY`, `IMMICH_ALBUM` | Where to upload (see below) |
+| `DELETE_FROM_DRONE` | `yes` = delete from the drone once checked on the Pi. `no` = never delete |
+| `CACHE_LIMIT_GB` | The most the cache on the Pi may hold |
+| `KEEP_FREE_GB` | Space always left free on the Pi for everything else |
+| `REFILL_CHECK_MINUTES` | How often to check if the cache has emptied, to refill it |
+| `REFILL_GIVE_UP_HOURS` | How long to wait for the cache to empty before stopping |
 
 `IMMICH_URL` is the address you open Immich at in your browser, including the port number (Immich's default port is 2283). Save with Ctrl+O then Enter, and exit with Ctrl+X.
 
@@ -113,7 +161,7 @@ Then check the settings work:
 sudo dji-drone-sync.sh --check
 ```
 
-It prints `OK` and the album name when everything is right, or `!!` and what's wrong. It also shows the cache limit, and whether files are deleted from the drone.
+It prints `OK` and the album name when everything is right, or `!!` and what's wrong. It also shows the cache limit, how much space the Pi has free, and whether files are deleted from the drone.
 
 ## Usage
 
@@ -123,7 +171,7 @@ It prints `OK` and the album name when everything is right, or `!!` and what's w
    tail -f /var/log/dji-drone-sync.log
    ```
    (Press Ctrl+C to stop watching. That doesn't stop the dock.)
-3. **Wait** until the log says `the drone can be unplugged`, then unplug it. If deleting is on, the line before says how much was freed on the drone. The upload carries on without the drone.
+3. **Wait** until the log says `the drone can be unplugged`, then unplug it. If deleting is on, it says how much was freed on the drone. With a lot on the drone this can take several rounds (see "Refilling the cache"); `round N done ... keep it plugged in` means it's still working. The upload carries on without the drone.
 
 Run a sync by hand with:
 
@@ -187,9 +235,18 @@ Each problem shows the message you'll see in `/var/log/dji-drone-sync.log`.
 - Immich gave the reason in brackets. The file stays in the cache and is tried again every 15 minutes. If it can never be uploaded, move it out of `/var/lib/dji-drone/cache` yourself.
 
 **`N file(s) didn't fit in the cache on the Pi`**
-- The 20 GB cache was full (or the Pi's own SD card was getting full), so only some files were copied. The rest are still on the drone, **not deleted**. Once the cache is uploaded, plug the drone in again to copy the rest.
+- The 20 GB cache was full (or the Pi's own SD card was getting full), so only some files were copied. The rest are still on the drone, **not deleted**. If the drone stays plugged in, the dock refills the cache once it's been uploaded.
 - To see how full the cache is: `sudo du -sh /var/lib/dji-drone/cache`
 - To see the Pi's free space: `df -h /var/lib/dji-drone`
+
+**`stopped refilling: N file(s) are still on the drone, because ...`**
+- The reason is at the end of the line. They're safe on the drone; plug it in again later to carry on.
+- `the cache on the Pi hasn't emptied for 12 hour(s)`: Immich is down or not set up, so nothing could be uploaded.
+- `they're too big to fit in the cache`: raise `CACHE_LIMIT_GB`, or free up space on the Pi.
+- `the cache is still full of files Immich didn't accept`: see "Immich didn't accept" above.
+
+**`the drone was unplugged - N file(s) are still on it`**
+- It was unplugged while waiting to refill. Nothing is lost: plug it in again to copy the rest.
 
 **`NOT deleted from the drone, because ...`**
 - A safety check stopped a delete: the file on the drone wasn't identical to the copy on the Pi (or in Immich). It stays on the drone. This can happen if two different files have the same name. Nothing needs doing; it's copied and checked again on a later dock.
@@ -209,7 +266,7 @@ Each problem shows the message you'll see in `/var/log/dji-drone-sync.log`.
 **Checking the 15 minute timer**
 - `systemctl list-timers dji-drone-flush.timer` shows when it last ran and when it runs next.
 
-`systemctl status dji-drone-sync.service` shows **failed** when the drone couldn't be found, a copy, delete or upload failed, the API key was rejected, or the sync was stopped by its 4 hour time limit.
+`systemctl status dji-drone-sync.service` shows **failed** when the drone couldn't be found, a copy, delete or upload failed, the API key was rejected, or the sync was stopped by its 24 hour time limit.
 
 ## Notes
 
