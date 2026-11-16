@@ -1,7 +1,8 @@
 #!/bin/bash
 # Installs the DJI drone photo dock. Run with: sudo ./install.sh
-# Safe to run again, e.g. after updating this repo. Your Immich settings
-# are kept.
+# Safe to run again, e.g. after updating this repo. Your settings are kept;
+# settings that are new in this version are added (it asks about deleting
+# from the drone).
 
 # Stop at the first command that fails
 set -e
@@ -69,9 +70,30 @@ if [ ! -f "$CONF" ]; then
      /^IMMICH_URL=/     { print "IMMICH_URL=" ENVIRON["URL"]; next }
      /^IMMICH_API_KEY=/ { print "IMMICH_API_KEY=" ENVIRON["KEY"]; next }
      /^IMMICH_ALBUM=/   { print "IMMICH_ALBUM=" ENVIRON["ALBUM"]; next }
+     /^# ---- Dock settings/ { exit }
      { print }' examples/immich.conf.example > "$CONF")
 fi
 chmod 600 "$CONF"
+
+# Settings added in newer versions: add them to an existing settings file
+# if they're missing, without touching anything that's already there.
+if ! grep -q '^[[:space:]]*DELETE_FROM_DRONE[[:space:]]*=' "$CONF"; then
+  ANSWER=n
+  if [ -t 0 ]; then
+    echo
+    echo "Delete photos and videos from the drone once they're copied to the Pi?"
+    echo "(They're checked byte for byte first. Until they're uploaded, the Pi has the only copy.)"
+    read -rp "Delete from the drone? [Y/n]: " ANSWER
+    case "$ANSWER" in [nN]*) ANSWER=n ;; *) ANSWER=y ;; esac
+  else
+    echo "Note: no terminal, so not deleting from the drone. To turn it on, set DELETE_FROM_DRONE=yes in $CONF"
+  fi
+  if [ "$ANSWER" = y ]; then VALUE=yes; else VALUE=no; fi
+  printf '\n# yes = delete photos/videos from the drone once their copy on the Pi is checked\nDELETE_FROM_DRONE=%s\n' "$VALUE" >> "$CONF"
+fi
+if ! grep -q '^[[:space:]]*CACHE_LIMIT_GB[[:space:]]*=' "$CONF"; then
+  printf '\n# The most the cache on the Pi may hold, in GB\nCACHE_LIMIT_GB=20\n' >> "$CONF"
+fi
 
 echo
 echo "Checking the Immich settings..."

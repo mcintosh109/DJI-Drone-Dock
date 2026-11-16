@@ -33,5 +33,6 @@ WAITING=$(find /var/lib/dji-drone/cache -type f -not -name '.*' 2>/dev/null | wc
 if [ "$WAITING" -gt 0 ]; then
   echo
   echo "WARNING: $WAITING photo(s)/video(s) in /var/lib/dji-drone/cache were never uploaded to Immich."
+  echo "If deleting from the drone was on, these may be the ONLY copies."
   echo "Copy them somewhere safe before deleting that folder."
 fi

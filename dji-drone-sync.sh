@@ -11,6 +11,11 @@
 # Immich, into an album (default "Drone Photos"). If Immich is down, the
 # files wait safely in the cache, and flush mode uploads them once it's back.
 #
+# With DELETE_FROM_DRONE=yes (the installer asks), each file is deleted from
+# the drone as soon as its copy in the cache has been checked byte for byte,
+# BEFORE the upload, so the drone's storage is free when it's unplugged.
+# Until the upload finishes, the cache on the Pi holds the only copy.
+#
 # DJI drones show up on a computer in one of two ways, depending on the model:
 #   - as USB drives ("mass storage"): one drive per storage. These are
 #     mounted READ-ONLY, so nothing on the drone can be changed.
@@ -19,15 +24,20 @@
 # Both are tried, and every DCIM folder found is copied.
 #
 # Safeguards:
-#   - nothing on the drone is ever changed or deleted
+#   - nothing on the drone is changed, unless DELETE_FROM_DRONE=yes. Then a
+#     file is only deleted from the drone once the copy in the cache has
+#     been compared with it byte for byte (or, for a file that's already in
+#     Immich, its checksum matches the one Immich confirmed). Files that
+#     didn't fit in the cache are never deleted.
 #   - only DJI devices are touched (USB vendor ID 2ca3), and never the RC 2
 #     controller (product 1021), so this can share a Pi with the RC 2 dock
 #   - a cached file is only deleted once Immich confirms it has it, and it
 #     has been added to the album
 #   - Immich itself recognises files it already has (by their checksum),
 #     so nothing is ever uploaded twice
-#   - it leaves KEEP_FREE_MB of space free on the Pi, so a big video can't
-#     fill up the SD card; what didn't fit is copied on a later dock
+#   - the cache holds at most CACHE_LIMIT_GB (default 20 GB), and it always
+#     leaves KEEP_FREE_MB free on the Pi, so big videos can't fill up the
+#     SD card; what didn't fit stays on the drone for a later dock
 #   - files are copied under a hidden name and renamed when complete, and
 #     hidden files are never uploaded, so half-copied files are never sent
 #   - the drone is always unmounted, even if something goes wrong
@@ -45,7 +55,7 @@ set -u
 MNT=${DJI_MNT:-/mnt/drone}
 STATE=${DJI_STATE:-/var/lib/dji-drone}   # on the Pi's SD card
 CACHE=$STATE/cache                       # files waiting to be uploaded to Immich
-IMPORTED=$STATE/imported.list            # files already in Immich: "size<TAB>path"
+IMPORTED=$STATE/imported.list            # files already in Immich: "size<TAB>checksum<TAB>path"
 WAITING_FLAG=$STATE/immich-waiting       # exists while uploads can't happen (so it's logged once)
 LOG=${DJI_LOG:-/var/log/dji-drone-sync.log}
 CONF=${DJI_CONF:-/etc/dji-drone/immich.conf}
@@ -60,6 +70,7 @@ SKIP_PRODUCTS=${DJI_SKIP_PRODUCTS:-1021} # USB product IDs to ignore (1021 = RC 
 KEEP_FREE_MB=${DJI_KEEP_FREE_MB:-2048}   # always leave this much space free on the Pi
 PROC_MOUNTS=${DJI_PROC_MOUNTS:-/proc/mounts}
 FREE_KB_OVERRIDE=${DJI_FREE_KB:-}        # tests only: pretend this much space is free
+CACHE_LIMIT_MB_OVERRIDE=${DJI_CACHE_LIMIT_MB:-}  # tests only: a cache limit smaller than 1 GB
 DEVICE_ID=dji-drone-dock                 # how this dock names itself to Immich
 
 MODE=dock
@@ -161,10 +172,13 @@ find_mass_storage() {
 }
 
 # Mount the drone's storage under $MNT. Returns 0 if anything was mounted.
-# On failure, MOUNT_ERR says what went wrong.
+# On failure, MOUNT_ERR says what went wrong. USB_DRIVES holds the names of
+# storages that are USB drives (mounted read-only).
+declare -A USB_DRIVES=()
 mount_drone() {
   local dev label name base n=0 n2 err bus devnum f3 f4 product
   MOUNT_ERR=""
+  USB_DRIVES=()
 
   # 1. USB drives (mass storage): each one at $MNT/<its label>, read-only
   while IFS=$'\t' read -r dev label; do
@@ -175,6 +189,7 @@ mount_drone() {
     mkdir -p "$MNT/$name"
     if err=$(mount -o ro,nosuid,nodev,noexec "$dev" "$MNT/$name" 2>&1); then
       log "mounted $dev ($name) read-only"
+      USB_DRIVES["$name"]=1
       n=$((n + 1))
     else
       MOUNT_ERR="$dev: $err"
@@ -202,6 +217,16 @@ mount_drone() {
     MOUNT_ERR=$err
   done < <(jmtpfs -l 2>/dev/null)
   return 1
+}
+
+# The storage a DCIM folder is on: the first folder under $MNT, e.g.
+# "SD_card". Files go into the cache as <storage>/<path inside DCIM>, so a
+# DJI_0001.JPG on the SD card and one in internal storage don't clash.
+storage_of() {
+  local s=${1#"$MNT"/}
+  if [ "$s" = "${s%%/*}" ]; then echo drone   # DCIM directly at the top
+  else echo "${s%%/*}"
+  fi
 }
 
 # ---- Talking to Immich -------------------------------------------------------
@@ -303,6 +328,98 @@ connect_immich() {
   return 0
 }
 
+# The dock's own settings, from the same config file:
+#   DELETE_FROM_DRONE  yes = delete each file from the drone once its copy on
+#                      the Pi is checked. Anything else, or missing = never.
+#   CACHE_LIMIT_GB     the most the cache on the Pi may hold (default 20)
+read_dock_settings() {
+  case "$(conf_get DELETE_FROM_DRONE)" in
+    yes|Yes|YES|true|on|1) DELETE_FROM_DRONE=yes ;;
+    *) DELETE_FROM_DRONE=no ;;
+  esac
+  local gb; gb=$(conf_get CACHE_LIMIT_GB)
+  if ! [[ $gb =~ ^[0-9]+$ ]] || [ "$gb" -eq 0 ]; then
+    [ -n "$gb" ] && log "CACHE_LIMIT_GB=$gb isn't a whole number of GB - using 20"
+    gb=20
+  fi
+  if [ -n "$CACHE_LIMIT_MB_OVERRIDE" ]; then CACHE_LIMIT=$(( CACHE_LIMIT_MB_OVERRIDE * 1024 * 1024 ))
+  else CACHE_LIMIT=$(( gb * 1024 * 1024 * 1024 ))
+  fi
+}
+
+# Delete from the drone the files in DCIM folder $1 that are safely on the
+# Pi. A file is deleted only if:
+#   - its copy in the cache is identical, byte for byte (cmp), or
+#   - it's already in Immich and its checksum matches the one Immich
+#     confirmed (from imported.list).
+# Anything else is left on the drone: files that didn't fit in the cache,
+# failed copies, and a different file that happens to have the same name.
+# USB drives were mounted read-only, so they're made writable just for this.
+# Returns 1 if something couldn't be deleted.
+delete_from_drone() {
+  local dcim=$1 storage mp size rel key sum lrf writable=no failed=0 list=$TMP/delete-list
+  storage=$(storage_of "$dcim")
+
+  # First make the list, then delete (never delete while still listing)
+  : > "$list"
+  while IFS=$'\t' read -r size rel; do
+    case "/$rel" in */.*) continue ;; esac
+    is_media "$rel" || continue
+    key="$storage/$rel"
+    if [ -f "$CACHE/$key" ] || [ -n "${CONFIRMED["$size"$'\t'"$key"]:-}" ]; then
+      printf '%s\t%s\n' "$size" "$rel" >> "$list"
+    fi
+  done < <(find "$dcim" -type f -printf '%s\t%P\n' 2>/dev/null)
+  [ -s "$list" ] || return 0
+
+  mp="$MNT/$storage"
+  if [ -n "${USB_DRIVES[$storage]+x}" ]; then
+    if ! mount -o remount,rw "$mp" 2>> "$LOG"; then
+      log "could not delete from $storage: it can't be made writable - the files stay on the drone"
+      return 1
+    fi
+    writable=yes
+  fi
+
+  while IFS=$'\t' read -r size rel; do
+    key="$storage/$rel"
+    if [ -f "$CACHE/$key" ]; then
+      # cmp reads both files and says if they're identical
+      if ! cmp -s "$dcim/$rel" "$CACHE/$key"; then
+        log "NOT deleted from the drone, because the copy on the Pi isn't identical: $key"
+        continue
+      fi
+    elif [ -z "${CONFIRMED["$size"$'\t'"$key"]:-}" ]; then
+      # Can happen if an upload took the cached copy away just now: it's
+      # safe on the drone, and is deleted on a later dock
+      log "NOT deleted from the drone, because no checked copy was found: $key"
+      continue
+    else
+      sum=$(sha1sum "$dcim/$rel" 2>/dev/null | cut -d ' ' -f 1)
+      if [ "$sum" != "${CONFIRMED["$size"$'\t'"$key"]}" ]; then
+        log "NOT deleted from the drone, because it doesn't match the copy in Immich: $key"
+        continue
+      fi
+    fi
+    if rm -f -- "${dcim:?}/${rel:?}" 2>> "$LOG" && [ ! -e "$dcim/$rel" ]; then
+      DELETED=$((DELETED + 1)); DELETED_BYTES=$((DELETED_BYTES + size))
+      # A video's low-quality preview (.LRF) is no use without the video
+      for lrf in "$dcim/${rel%.*}.LRF" "$dcim/${rel%.*}.lrf"; do
+        [ -f "$lrf" ] && rm -f -- "${lrf:?}"
+      done
+    else
+      log "could not delete from the drone: $key"
+      failed=1
+    fi
+  done < "$list"
+
+  if [ "$writable" = yes ]; then
+    sync    # make sure the deletes are written to the drone before unmounting
+    mount -o remount,ro "$mp" 2>> "$LOG"
+  fi
+  return "$failed"
+}
+
 # ---- Check mode: test the settings and print the result ------------------------
 if [ "$MODE" = check ]; then
   trap 'rm -rf "$TMP"' EXIT
@@ -315,7 +432,13 @@ if [ "$MODE" = check ]; then
   if [ "$status" -eq 0 ]; then
     echo "OK   Immich at $IMMICH_URL is reachable, the API key works, and uploads go to the album \"$ALBUM\""
   fi
-  echo "     $(cached_count) file(s) are waiting in the cache on the Pi"
+  read_dock_settings
+  echo "     the cache on the Pi holds up to $(human "$CACHE_LIMIT"); $(cached_count) file(s) are waiting in it"
+  if [ "$DELETE_FROM_DRONE" = yes ]; then
+    echo "     files ARE deleted from the drone once they're copied to the Pi (DELETE_FROM_DRONE=yes)"
+  else
+    echo "     files are NOT deleted from the drone (to turn that on: DELETE_FROM_DRONE=yes)"
+  fi
   [ "$status" -eq 0 ]
   exit
 fi
@@ -344,6 +467,7 @@ if ! mkdir -p "$CACHE" 2>> "$LOG"; then
 fi
 touch "$IMPORTED"
 COPY_FAILED=0
+read_dock_settings
 
 # ==== Dock mode: drone -> cache =================================================
 if [ "$MODE" = dock ]; then
@@ -383,29 +507,31 @@ if [ "$MODE" = dock ]; then
     WAITED=$((WAITED + RETRY_EVERY))
   done
 
-  # Files already in Immich are remembered as "size<TAB>path", so they
-  # aren't copied again. The size is included so that a new photo that
-  # happens to reuse an old name (e.g. after formatting the card) is still copied.
-  declare -A IN_IMMICH=()
-  while IFS=$'\t' read -r size key; do
+  # Files already in Immich are remembered as "size<TAB>checksum<TAB>path",
+  # so they aren't copied again. The size is included so that a new photo
+  # that happens to reuse an old name (e.g. after formatting the card) is
+  # still copied. CONFIRMED holds the checksum Immich confirmed for each.
+  declare -A IN_IMMICH=() CONFIRMED=()
+  while IFS=$'\t' read -r size a b; do
+    key=${b:-$a}    # older lines have no checksum: "size<TAB>path"
     [ -n "$key" ] && IN_IMMICH["$size"$'\t'"$key"]=1
+    [ -n "$b" ] && CONFIRMED["$size"$'\t'"$b"]=$a
   done < "$IMPORTED"
 
-  # How much may be copied: the free space on the Pi, minus KEEP_FREE_MB
+  # How much may be copied: whichever is smaller of
+  #   - the room left in the cache: CACHE_LIMIT minus what's already in it
+  #   - the free space on the Pi, minus KEEP_FREE_MB
   if [ -n "$FREE_KB_OVERRIDE" ]; then free_kb=$FREE_KB_OVERRIDE
   else free_kb=$(df -Pk "$CACHE" | awk 'NR == 2 { print $4 }')
   fi
-  BUDGET=$(( free_kb * 1024 - KEEP_FREE_MB * 1024 * 1024 ))
+  DISK_ROOM=$(( free_kb * 1024 - KEEP_FREE_MB * 1024 * 1024 ))
+  CACHE_USED=$(find "$CACHE" -type f -printf '%s\n' | awk '{ s += $1 } END { print s + 0 }')
+  CACHE_ROOM=$(( CACHE_LIMIT - CACHE_USED ))
+  BUDGET=$(( CACHE_ROOM < DISK_ROOM ? CACHE_ROOM : DISK_ROOM ))
 
   NEW=0; NEW_BYTES=0; NO_ROOM=0; NO_ROOM_BYTES=0; i=0
   for dcim in "${DCIMS[@]}"; do
-    # The storage's name is the first folder under $MNT, e.g. "SD_card".
-    # Files go into the cache as <storage>/<path inside DCIM>, so a
-    # DJI_0001.JPG on the SD card and one in internal storage don't clash.
-    storage=${dcim#"$MNT"/}
-    if [ "$storage" = "${storage%%/*}" ]; then storage=drone   # DCIM directly at the top
-    else storage=${storage%%/*}
-    fi
+    storage=$(storage_of "$dcim")
     i=$((i + 1))
     want=$TMP/want-$i
     : > "$want"
@@ -442,17 +568,27 @@ if [ "$MODE" = dock ]; then
       }
     fi
   done
-  unmount_all   # finished with the drone: it can be unplugged now
-  COPYING=no
-
   if [ "$NEW" -eq 0 ] && [ "$NO_ROOM" -eq 0 ]; then
     log "no new photos or videos on the drone"
   else
-    log "copied $NEW new photo(s)/video(s) from the drone ($(human "$NEW_BYTES")) - the drone can be unplugged"
+    log "copied $NEW new photo(s)/video(s) from the drone ($(human "$NEW_BYTES"))"
   fi
   if [ "$NO_ROOM" -gt 0 ]; then
-    log "$NO_ROOM file(s) ($(human "$NO_ROOM_BYTES")) didn't fit on the Pi (it keeps ${KEEP_FREE_MB} MB free) - dock the drone again after the upload to copy the rest"
+    log "$NO_ROOM file(s) ($(human "$NO_ROOM_BYTES")) didn't fit in the cache on the Pi (it holds up to $(human "$CACHE_LIMIT"), and keeps ${KEEP_FREE_MB} MB of the Pi free) - they stay on the drone; dock it again after the upload to copy them"
   fi
+
+  # Free up the drone: delete what is now safely on the Pi (or in Immich)
+  if [ "$DELETE_FROM_DRONE" = yes ]; then
+    DELETED=0; DELETED_BYTES=0
+    for dcim in "${DCIMS[@]}"; do
+      delete_from_drone "$dcim" || COPY_FAILED=1
+    done
+    [ "$DELETED" -gt 0 ] && log "deleted $DELETED photo(s)/video(s) from the drone ($(human "$DELETED_BYTES") freed) - they're on the Pi, waiting for Immich"
+  fi
+
+  unmount_all   # finished with the drone: it can be unplugged now
+  COPYING=no
+  log "the drone can be unplugged"
   # Let another dock start copying, while this one uploads
   flock -u 8
 else
@@ -540,7 +676,7 @@ while IFS= read -r -d '' f <&3; do
   fi
 
   # Confirmed: remember it, then remove it from the cache
-  printf '%s\t%s\n' "$size" "$key" >> "$IMPORTED"
+  printf '%s\t%s\t%s\n' "$size" "$sum" "$key" >> "$IMPORTED"
   rm -f "$f"
   if [ "$status" = duplicate ]; then
     DUPES=$((DUPES + 1))

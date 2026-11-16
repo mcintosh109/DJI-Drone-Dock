@@ -59,19 +59,43 @@ case "$dev" in
   *)                   printf 'ID_PATH=platform-mmc\n' ;;
 esac
 EOF
+# Changes made in a mounted folder (deleted files) only reach the fake
+# drone if the mount is writable, like a real one: fake-writeback copies
+# the folder back to the fake drone when its mount is "rw". MTP mounts are
+# always writable; USB drives only after "mount -o remount,rw".
+cat > "$T/bin/fake-writeback" <<EOF
+#!/bin/bash
+mp=\$1
+line=\$(grep " \$mp " "$T/proc-mounts" | head -n1)
+src=\${line%% *}; opts=\$(echo "\$line" | cut -d" " -f4)
+case ",\$opts," in *,rw,*) ;; *) exit 0 ;; esac
+if [ "\$src" = jmtpfs ]; then dest="$T/mtp-drone"; else dest="$T/ums/\$(basename "\$src")"; fi
+find "\$dest" -mindepth 1 -delete
+cp -a "\$mp/." "\$dest/"
+EOF
 cat > "$T/bin/mount" <<EOF
 #!/bin/bash
-# mount -o OPTIONS DEVICE FOLDER
-opts=\$2; dev=\$3; mp=\$4
+# mount -o OPTIONS DEVICE FOLDER, or mount -o remount,rw|ro FOLDER
+opts=\$2
+if [[ \$opts == remount,* ]]; then
+  mp=\$3; new=\${opts#remount,}
+  echo "remount \$new \$(basename "\$mp")" >> "$T/mount-calls"
+  fake-writeback "\$mp"    # changes made while writable are kept
+  awk -v mp="\$mp" -v o="\$new" '\$2 == mp { \$4 = o } { print }' "$T/proc-mounts" > "$T/pm.tmp"
+  mv "$T/pm.tmp" "$T/proc-mounts"
+  exit 0
+fi
+dev=\$3; mp=\$4
 echo "mount \$opts \$dev" >> "$T/mount-calls"
 cp -a "$T/ums/\$(basename "\$dev")/." "\$mp/"
 echo "\$dev \$mp vfat \$opts 0 0" >> "$T/proc-mounts"
 EOF
-# umount / fusermount: empty the folder and forget the mount
+# umount / fusermount: keep changes if writable, empty the folder, forget the mount
 cat > "$T/bin/umount" <<EOF
 #!/bin/bash
 for a; do mp=\$a; done
 grep -q " \$mp " "$T/proc-mounts" || exit 1
+fake-writeback "\$mp"
 find "\$mp" -mindepth 1 -delete
 grep -v " \$mp " "$T/proc-mounts" > "$T/pm.tmp"; mv "$T/pm.tmp" "$T/proc-mounts"
 echo "unmounted \$mp" >> "$T/mount-calls"
@@ -148,7 +172,7 @@ export DJI_MNT="$T/mnt" DJI_STATE="$T/state" DJI_LOG="$T/sync.log" DJI_CONF="$T/
        DJI_LOCK_DIR="$T" DJI_PROC_MOUNTS="$T/proc-mounts" DJI_DETECT_WAIT=0 DJI_RETRY_EVERY=1 \
        DJI_FREE_KB=100000000 DJI_KEEP_FREE_MB=0
 
-write_conf() { printf 'IMMICH_URL=http://immich.test:2283/\nIMMICH_API_KEY="%s"\nIMMICH_ALBUM=%s\n' "${1:-TESTKEY}" "${2:-Drone Photos}" > "$T/immich.conf"; }
+write_conf() { printf 'IMMICH_URL=http://immich.test:2283/\nIMMICH_API_KEY="%s"\nIMMICH_ALBUM=%s\nDELETE_FROM_DRONE=%s\n' "${1:-TESTKEY}" "${2:-Drone Photos}" "${3:-no}" > "$T/immich.conf"; }
 # media STORAGE PATH-INSIDE-DCIM [content]: put a file on the fake MTP drone
 media() { mkdir -p "$(dirname "$T/mtp-drone/$1/DCIM/$2")"; echo "${3:-photo $1 $2}" > "$T/mtp-drone/$1/DCIM/$2"; }
 cached() { find "$T/state/cache" -type f -not -name '.*' 2>/dev/null | wc -l; }
@@ -314,7 +338,7 @@ head -c 600000 /dev/urandom > "$T/mtp-drone/SD card/DCIM/DJI_002/DJI_20260309100
 DJI_FREE_KB=1000 FAKE_IMMICH_DOWN=1 bash "$SYNC"; code=$?
 check "exit 0" [ "$code" -eq 0 ]
 check "only what fits is copied" [ "$(cached)" -eq 1 ]
-check "the log says the rest didn't fit" grep -q "1 file(s) (586KB) didn.t fit on the Pi" "$T/sync.log"
+check "the log says the rest didn't fit" grep -q "1 file(s) (586KB) didn't fit in the cache on the Pi" "$T/sync.log"
 bash "$SYNC"
 check "the rest is copied and uploaded on the next dock" bash -c "grep -q 'uploaded: SD card/DJI_002/DJI_20260309100000_0011_D.MP4' '$T/sync.log' && [ \$(find '$T/state/cache' -type f | wc -l) -eq 0 ]"
 
@@ -353,7 +377,8 @@ rm -f "$T/ums-on"; touch "$T/mtp-on"
 
 echo "A leftover mount from a crashed run"
 mkdir -p "$T/mnt"
-echo "jmtpfs $T/mnt fuse.jmtpfs rw 0 0" >> "$T/proc-mounts"
+# (marked "ro" so the fake doesn't copy the empty leftover folder back onto the drone)
+echo "jmtpfs $T/mnt fuse.jmtpfs ro 0 0" >> "$T/proc-mounts"
 bash "$SYNC"; code=$?
 check "is removed" grep -q "removing a leftover mount" "$T/sync.log"
 check "  ...then syncs normally (exit 0)" [ "$code" -eq 0 ]
@@ -401,6 +426,93 @@ echo "A reused name (e.g. after formatting the card) is still copied"
 media "SD card" DJI_001/DJI_20260301101500_0001_D.JPG "a brand new, longer photo after formatting"
 bash "$SYNC"
 check "the new photo is uploaded" [ "$(grep -c "uploaded: SD card/DJI_001/DJI_20260301101500_0001_D.JPG" "$T/sync.log")" -eq 2 ]
+
+# ==== Deleting from the drone (DELETE_FROM_DRONE=yes) ==========================
+on_drone() { [ -e "$T/mtp-drone/SD card/DCIM/$1" ]; }
+
+echo "Deleting is off: nothing is deleted from the drone"
+check "the photos uploaded above are all still on the drone" on_drone DJI_001/DJI_20260302120000_0003_D.JPG
+
+echo "Delete from the drone once copied to the Pi (Immich down, so nothing is uploaded)"
+write_conf TESTKEY "Drone Photos" yes
+media "SD card" DJI_003/DJI_20260320100000_0020_D.JPG
+media "SD card" DJI_003/DJI_20260320100500_0021_D.MP4 "a video"
+media "SD card" DJI_003/DJI_20260320100500_0021_D.LRF "its preview"
+media "SD card" DJI_003/DJI_20260320100500_0021_D.SRT "its subtitles"
+FAKE_IMMICH_DOWN=1 bash "$SYNC"; code=$?
+check "exit 0" [ "$code" -eq 0 ]
+check "the new photo and video are in the cache on the Pi" bash -c "ls '$T/state/cache/SD card/DJI_003/DJI_20260320100000_0020_D.JPG' '$T/state/cache/SD card/DJI_003/DJI_20260320100500_0021_D.MP4'"
+check "  ...and deleted from the drone" bash -c "! ls '$T/mtp-drone/SD card/DCIM/DJI_003/'*.JPG '$T/mtp-drone/SD card/DCIM/DJI_003/'*.MP4"
+check "  ...along with the video's .LRF preview" bash -c "! ls '$T/mtp-drone/SD card/DCIM/DJI_003/'*.LRF"
+check "  ...but the .SRT subtitles are kept" on_drone DJI_003/DJI_20260320100500_0021_D.SRT
+check "files already in Immich are deleted from the drone too" bash -c "! ls '$T/mtp-drone/SD card/DCIM/DJI_001/DJI_20260302120000_0003_D.JPG'"
+check "  ...from internal storage too" bash -c "! ls '$T/mtp-drone/Internal shared storage/DCIM/DJI_001/DJI_0001.JPG'"
+check "the log says how much was freed" grep -q "deleted .* photo(s)/video(s) from the drone" "$T/sync.log"
+check "  ...BEFORE it says the drone can be unplugged" bash -c "grep 'deleted .* from the drone\|the drone can be unplugged' '$T/sync.log' | tail -2 | head -1 | grep -q deleted"
+check "the drone was unmounted" nothing_mounted
+bash "$SYNC" --flush
+check "the next flush uploads them" grep -q "uploaded: SD card/DJI_003/DJI_20260320100500_0021_D.MP4" "$T/sync.log"
+
+echo "A file whose copy on the Pi isn't identical is NOT deleted"
+media "SD card" DJI_003/CLASH.JPG "the drone's version, longer"
+mkdir -p "$T/state/cache/SD card/DJI_003"
+echo "pi version" > "$T/state/cache/SD card/DJI_003/CLASH.JPG"
+FAKE_IMMICH_DOWN=1 bash "$SYNC"
+check "kept on the drone" on_drone DJI_003/CLASH.JPG
+check "  ...and the log says why" grep -q "NOT deleted from the drone, because the copy on the Pi isn't identical: SD card/DJI_003/CLASH.JPG" "$T/sync.log"
+rm -f "$T/state/cache/SD card/DJI_003/CLASH.JPG" "$T/mtp-drone/SD card/DCIM/DJI_003/CLASH.JPG"
+
+echo "A file that doesn't match what Immich confirmed is NOT deleted"
+media "SD card" DJI_003/MISMATCH.JPG "drone"
+printf '%s\t%s\t%s\n' 6 0000000000000000000000000000000000000000 "SD card/DJI_003/MISMATCH.JPG" >> "$T/state/imported.list"
+media "SD card" DJI_003/OLDLIST.JPG "old"
+printf '%s\t%s\n' 4 "SD card/DJI_003/OLDLIST.JPG" >> "$T/state/imported.list"
+bash "$SYNC"
+check "kept on the drone" on_drone DJI_003/MISMATCH.JPG
+check "  ...and the log says why" grep -q "NOT deleted from the drone, because it doesn't match the copy in Immich: SD card/DJI_003/MISMATCH.JPG" "$T/sync.log"
+check "a file remembered without a checksum (older list) is kept too" on_drone DJI_003/OLDLIST.JPG
+
+echo "Files that don't fit in the cache stay on the drone"
+mkdir -p "$T/mtp-drone/SD card/DCIM/DJI_004"
+head -c 700000 /dev/urandom > "$T/mtp-drone/SD card/DCIM/DJI_004/DJI_20260321100000_0030_D.MP4"
+head -c 700000 /dev/urandom > "$T/mtp-drone/SD card/DCIM/DJI_004/DJI_20260321100000_0031_D.MP4"
+DJI_CACHE_LIMIT_MB=1 FAKE_IMMICH_DOWN=1 bash "$SYNC"; code=$?
+check "exit 0" [ "$code" -eq 0 ]
+check "only one fits in the 1 MB test cache" [ "$(cached)" -eq 1 ]
+check "  ...that one is deleted from the drone" [ "$(find "$T/mtp-drone/SD card/DCIM/DJI_004" -type f | wc -l)" -eq 1 ]
+check "  ...the other one stays on the drone" bash -c "ls '$T/mtp-drone/SD card/DCIM/DJI_004/'*_0031_D.MP4"
+check "  ...and the log says so" grep -q "1 file(s) (684KB) didn't fit in the cache on the Pi (it holds up to 1.0MB" "$T/sync.log"
+DJI_CACHE_LIMIT_MB=1 bash "$SYNC" --flush    # the 15 minute upload empties the cache
+DJI_CACHE_LIMIT_MB=1 bash "$SYNC"
+check "after the upload, the next dock copies and deletes the other one" bash -c "[ -z \"\$(ls -A '$T/mtp-drone/SD card/DCIM/DJI_004')\" ]"
+
+echo "The cache limit counts what's already waiting in it"
+mkdir -p "$T/mtp-drone/SD card/DCIM/DJI_005"
+head -c 400000 /dev/urandom > "$T/mtp-drone/SD card/DCIM/DJI_005/DJI_20260322100000_0040_D.MP4"
+mkdir -p "$T/state/cache/waiting"
+head -c 800000 /dev/urandom > "$T/state/cache/waiting/old.MP4"
+DJI_CACHE_LIMIT_MB=1 FAKE_IMMICH_DOWN=1 bash "$SYNC"
+check "nothing new is copied (or deleted) when the cache is nearly full" bash -c "ls '$T/mtp-drone/SD card/DCIM/DJI_005/'*.MP4"
+rm -rf "$T/state/cache/waiting"
+
+echo "Deleting from a drone that shows up as USB drives (mounted read-only)"
+rm -f "$T/mtp-on"; touch "$T/ums-on"
+echo "new sd photo" > "$T/ums/sdb1/DCIM/100MEDIA/DJI_0200.JPG"
+: > "$T/mount-calls"
+FAKE_IMMICH_DOWN=1 bash "$SYNC"; code=$?
+check "exit 0" [ "$code" -eq 0 ]
+check "the drive was made writable just for deleting" grep -q "remount rw SD_card" "$T/mount-calls"
+check "  ...then read-only again" grep -q "remount ro SD_card" "$T/mount-calls"
+check "the photos are deleted from both drives" bash -c "[ -z \"\$(find '$T/ums/sdb1/DCIM' '$T/ums/sdc/DCIM' -type f)\" ]"
+check "  ...and are in the cache on the Pi" bash -c "ls '$T/state/cache/SD_card/100MEDIA/DJI_0200.JPG'"
+check "the USB stick was not touched" bash -c "ls '$T/ums/sdd1/DCIM/100MEDIA/STICK.JPG'"
+check "everything was unmounted" nothing_mounted
+rm -f "$T/ums-on"; touch "$T/mtp-on"
+
+echo "Check mode shows the drone settings"
+out=$(bash "$SYNC" --check)
+check "says files are deleted from the drone" grep -q "files ARE deleted from the drone" <<< "$out"
+check "  ...and the cache limit (20 GB by default)" grep -q "holds up to 20GB" <<< "$out"
 
 echo
 echo "$PASSED passed, $FAILED failed"

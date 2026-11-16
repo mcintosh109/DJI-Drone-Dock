@@ -12,3 +12,16 @@ IMMICH_API_KEY=CHANGE_ME
 
 # The album the photos and videos go into. It is created if it doesn't exist.
 IMMICH_ALBUM=Drone Photos
+
+# ---- Dock settings ----
+
+# yes = delete each photo/video from the drone as soon as its copy on the
+# Pi has been checked (compared byte for byte), BEFORE uploading. The
+# drone's storage is then free when you unplug it. Until the upload
+# finishes, the Pi holds the only copy.
+# no = never delete anything from the drone.
+DELETE_FROM_DRONE=yes
+
+# The most the cache on the Pi may hold, in GB. Files that don't fit stay
+# on the drone and are copied the next time you plug it in.
+CACHE_LIMIT_GB=20
