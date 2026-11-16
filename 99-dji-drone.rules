@@ -1,0 +1,3 @@
+# Any DJI USB device (vendor 2ca3) EXCEPT the RC 2 controller (product 1021),
+# which has its own dock. Check yours with `lsusb` while the drone is plugged in.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="2ca3", ATTR{idProduct}!="1021", TAG+="systemd", ENV{SYSTEMD_WANTS}="dji-drone-sync.service"

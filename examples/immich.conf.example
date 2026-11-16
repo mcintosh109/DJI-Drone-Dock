@@ -1,0 +1,14 @@
+# Settings for uploading drone photos and videos to Immich.
+# Installed as /etc/dji-drone/immich.conf (readable by root only).
+# Check them any time with: sudo dji-drone-sync.sh --check
+
+# The address you open Immich at in a web browser, including the port.
+IMMICH_URL=http://192.168.1.50:2283
+
+# An API key made in Immich: click your profile picture > Account Settings
+# > API Keys > New API Key. It needs these permissions:
+#   asset.upload, album.read, album.create, albumAsset.create
+IMMICH_API_KEY=CHANGE_ME
+
+# The album the photos and videos go into. It is created if it doesn't exist.
+IMMICH_ALBUM=Drone Photos

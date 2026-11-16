@@ -1,0 +1,14 @@
+[Unit]
+Description=Copy photos and videos from a DJI drone and upload them to Immich (started when the drone is plugged in)
+# Uploading needs the network, so start after it is up.
+# Immich is NOT required: if it is down, the files wait in the cache on
+# the Pi, and dji-drone-flush.timer uploads them when it is back.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dji-drone-sync.sh
+# Stop if it runs longer than this, e.g. a frozen USB connection.
+# Videos are big, so this is longer than the RC 2 dock's 30 minutes.
+TimeoutStartSec=4h

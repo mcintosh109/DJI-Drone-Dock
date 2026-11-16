@@ -1,0 +1,9 @@
+[Unit]
+Description=Upload DJI drone photos and videos waiting in the Pi's cache to Immich
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dji-drone-sync.sh --flush
+TimeoutStartSec=4h
