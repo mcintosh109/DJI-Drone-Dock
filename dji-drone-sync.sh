@@ -296,7 +296,8 @@ connect_immich() {
   ALBUM=$(conf_get IMMICH_ALBUM)
   [ -n "$ALBUM" ] || ALBUM="Drone Photos"
 
-  if [ -z "$IMMICH_URL" ] || [ -z "$key" ]; then
+  # CHANGE_ME is the placeholder the installer writes when Immich is skipped
+  if [ -z "$IMMICH_URL" ] || [ -z "$key" ] || [ "$key" = CHANGE_ME ]; then
     waiting setup "Immich isn't set up yet: add IMMICH_URL and IMMICH_API_KEY to $CONF - $(cached_count) file(s) kept in the cache on the Pi"
     return 2
   fi

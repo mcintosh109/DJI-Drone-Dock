@@ -212,6 +212,14 @@ check "the drone was unmounted" nothing_mounted
 check "the log says Immich isn't set up" grep -q "Immich isn't set up yet" "$T/sync.log"
 check "nothing was sent to Immich" [ ! -e "$T/immich/requests" ]
 
+echo "Immich skipped in the installer (placeholder key)"
+write_conf CHANGE_ME
+: > "$T/immich/requests"
+bash "$SYNC" --flush
+check "treated as not set up yet" bash -c "tail -n 3 '$T/sync.log' | grep -q \"Immich isn't set up yet\""
+check "  ...and Immich isn't contacted" [ ! -s "$T/immich/requests" ]
+rm -f "$T/immich.conf" "$T/state/immich-waiting"
+
 echo "Check mode with a wrong API key"
 write_conf WRONGKEY
 out=$(bash "$SYNC" --check); code=$?
