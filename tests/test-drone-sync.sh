@@ -141,6 +141,15 @@ case "\$method \$path" in
     id="album-\$(ls "\$I/albums" | grep -c name)"
     jq -r .albumName <<< "\$data" > "\$I/albums/\$id.name"; touch "\$I/albums/\$id.list"
     reply 201 "{\"id\":\"\$id\"}" ;;
+  "POST /assets/bulk-upload-check")
+    # "Do you already have this?" - FAKE_NO_PRECHECK: an Immich without it
+    [ -n "\${FAKE_NO_PRECHECK:-}" ] && reply 404 '{"message":"Cannot POST /api/assets/bulk-upload-check"}'
+    cid=\$(jq -r '.assets[0].id' <<< "\$data"); csum=\$(jq -r '.assets[0].checksum' <<< "\$data")
+    case "\$cid" in *UNSUPPORTED*) reply 200 "\$(jq -cn --arg i "\$cid" '{results:[{id:\$i,action:"reject",reason:"unsupported-format"}]}')" ;; esac
+    if [ -e "\$I/assets/\$csum" ]; then
+      reply 200 "\$(jq -cn --arg i "\$cid" --arg a "\$(head -n1 "\$I/assets/\$csum")" --argjson t "\$([ -n "\${FAKE_TRASHED:-}" ] && echo true || echo false)" '{results:[{id:\$i,action:"reject",reason:"duplicate",assetId:\$a,isTrashed:\$t}]}')"
+    fi
+    reply 200 "\$(jq -cn --arg i "\$cid" '{results:[{id:\$i,action:"accept"}]}')" ;;
   "POST /assets")
     for f in "\${form[@]}"; do case "\$f" in
       assetData=@*) file=\${f#assetData=@}; file=\${file#\"}; file=\${file%\"}; file=\${file//\\\\\\\\/\\\\}; file=\${file//\\\\\"/\"} ;;
@@ -620,6 +629,54 @@ check "both files stay in the cache" [ "$(cached)" -eq 2 ]
 bash "$SYNC" --flush
 check "the next run puts them in the album" [ "$(cached)" -eq 0 ]
 check "the log says which album it found" grep -q 'found the album "Drone Photos" in Immich (album ID album-0)' "$T/sync.log"
+
+# ==== Asking Immich first ("do you already have this?") ========================
+uploads() { grep -c "^POST .*/api/assets\$" "$T/immich/requests"; }
+
+echo "A file Immich already has isn't sent again"
+media "SD card" DJI_001/DJI_20260701100000_0400_D.JPG "already in immich"
+sum=$(sha1sum "$T/mtp-drone/SD card/DCIM/DJI_001/DJI_20260701100000_0400_D.JPG" | cut -d' ' -f1)
+printf 'asset-known\nknown.jpg\n' > "$T/immich/assets/$sum"
+: > "$T/immich/requests"
+bash "$SYNC"; code=$?
+check "exit 0" [ "$code" -eq 0 ]
+check "Immich was asked first" grep -q "POST .*/api/assets/bulk-upload-check" "$T/immich/requests"
+check "  ...and the file was NOT sent" [ "$(uploads)" -eq 0 ]
+check "  ...but it was put in the album" grep -qx "asset-known" "$T/immich/albums/album-0.list"
+check "  ...and left the cache" [ "$(cached)" -eq 0 ]
+
+echo "A new file is still sent"
+media "SD card" DJI_001/DJI_20260701100100_0401_D.JPG "brand new"
+: > "$T/immich/requests"
+bash "$SYNC"
+check "it was uploaded" [ "$(uploads)" -eq 1 ]
+check "  ...and is in the album" grep -q "uploaded: SD card/DJI_001/DJI_20260701100100_0401_D.JPG" "$T/sync.log"
+
+echo "An Immich without the check: just upload"
+media "SD card" DJI_001/DJI_20260701100200_0402_D.JPG "older immich"
+: > "$T/immich/requests"
+FAKE_NO_PRECHECK=1 bash "$SYNC"; code=$?
+check "exit 0" [ "$code" -eq 0 ]
+check "it was uploaded anyway" [ "$(uploads)" -eq 1 ]
+check "  ...and left the cache" [ "$(cached)" -eq 0 ]
+
+echo "Immich says it won't take a file type"
+media "SD card" DJI_001/DJI_UNSUPPORTED.JPG "odd file"
+: > "$T/immich/requests"
+bash "$SYNC"; code=$?
+check "exit 1" [ "$code" -eq 1 ]
+check "the log says why" grep -q "Immich won't take SD card/DJI_001/DJI_UNSUPPORTED.JPG (unsupported-format) - kept in the cache" "$T/sync.log"
+check "  ...it wasn't sent" [ "$(uploads)" -eq 0 ]
+check "  ...and stays in the cache" [ "$(cached)" -eq 1 ]
+rm -f "$T/state/cache/SD card/DJI_001/DJI_UNSUPPORTED.JPG" "$T/mtp-drone/SD card/DCIM/DJI_001/DJI_UNSUPPORTED.JPG"
+
+echo "A file that's in Immich's trash"
+media "SD card" DJI_001/DJI_20260701100300_0403_D.JPG "in the trash"
+sum=$(sha1sum "$T/mtp-drone/SD card/DCIM/DJI_001/DJI_20260701100300_0403_D.JPG" | cut -d' ' -f1)
+printf 'asset-trashed\ntrashed.jpg\n' > "$T/immich/assets/$sum"
+FAKE_TRASHED=1 bash "$SYNC"
+check "the log notes it's in the trash" grep -q "note: SD card/DJI_001/DJI_20260701100300_0403_D.JPG is in Immich's trash" "$T/sync.log"
+check "  ...and it was still put in the album" grep -qx "asset-trashed" "$T/immich/albums/album-0.list"
 
 echo
 echo "$PASSED passed, $FAILED failed"

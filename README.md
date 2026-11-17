@@ -270,7 +270,7 @@ Each problem shows the message you'll see in `/var/log/dji-drone-sync.log`.
 
 ## Notes
 
-- **Nothing is uploaded twice.** Before sending a file, the dock tells Immich its checksum (a fingerprint of its contents). If Immich already has it, for example from the phone app, it's just added to the album.
+- **Nothing is uploaded twice.** Before sending a file, the dock asks Immich if it already has it, by its checksum (a fingerprint of its contents). If Immich has it, for example from the phone app or an earlier run, the file isn't sent again: it's just added to the album. That turns a re-run from minutes per video into seconds. (On an older Immich without this check, the dock simply uploads, and Immich still recognises the duplicate.)
 - The Pi remembers what it has uploaded in `/var/lib/dji-drone/imported.list` (each file's size, checksum and name), so those files aren't copied off the drone again. To upload everything on the drone again, delete that file. Immich will recognise the ones it already has.
 - Immich reads each photo's real date and GPS position from the photo itself, so they show up in the right place on the timeline and map.
 - The API key is never put on a command line, where anyone logged in to the Pi could see it with `ps`.

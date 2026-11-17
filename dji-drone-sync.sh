@@ -633,7 +633,7 @@ upload_cache() {
   return "$result"
 }
 upload_cache_now() {
-  local count status code f key size sum when esc id ok
+  local count status code f key size sum when esc id ok action reason
   UPLOAD_DONE_ALL=no
   if [ "$MODE" = dock ] && [ "$1" != nowait ]; then
     if ! flock -w "$LOCK_WAIT" 9; then
@@ -672,33 +672,56 @@ upload_cache_now() {
     # curl needs " and \ in the file's path escaped inside the quotes
     esc=${f//\\/\\\\}; esc=${esc//\"/\\\"}
 
-    # Immich reads the real date and GPS position from the photo itself;
-    # the file's date is only a fallback. deviceAssetId and deviceId are
-    # needed by older versions of Immich, and ignored by newer ones.
-    # --speed-time/--speed-limit give up if nothing is sent for 2 minutes.
-    code=$(api POST /assets -H "x-immich-checksum: $sum" \
-      -F "assetData=@\"$esc\"" \
-      --form-string "deviceAssetId=$key-$size" \
-      --form-string "deviceId=$DEVICE_ID" \
-      --form-string "fileCreatedAt=$when" \
-      --form-string "fileModifiedAt=$when" \
-      --form-string "filename=$(basename "$f")" \
-      --speed-time 120 --speed-limit 1)
+    # Ask Immich first if it already has this file, by its checksum, so a
+    # file it has is never sent again (a big video would take minutes).
+    # If this check doesn't work (e.g. an older Immich), just upload.
+    status=""; id=""
+    code=$(api POST /assets/bulk-upload-check --max-time 60 -H 'Content-Type: application/json' \
+      -d "$(jq -cn --arg id "$key" --arg c "$sum" '{assets: [{id: $id, checksum: $c}]}')")
+    if [ "$code" = 200 ] || [ "$code" = 201 ]; then
+      action=$(jq -r '.results[0].action // empty' "$RESP" 2>/dev/null)
+      reason=$(jq -r '.results[0].reason // empty' "$RESP" 2>/dev/null)
+      if [ "$action" = reject ] && [ "$reason" = duplicate ]; then
+        status=duplicate
+        id=$(jq -r '.results[0].assetId // empty' "$RESP" 2>/dev/null)
+        if [ "$(jq -r '.results[0].isTrashed // false' "$RESP" 2>/dev/null)" = true ]; then
+          log "note: $key is in Immich's trash - it's added to the album, but stays hidden until you restore it from the trash in Immich"
+        fi
+      elif [ "$action" = reject ]; then
+        log "Immich won't take $key (${reason:-no reason given}) - kept in the cache"
+        FAILED=$((FAILED + 1)); continue
+      fi
+    fi
 
-    case "$code" in
-      200|201) ;;
-      000)
-        log "lost the connection to Immich ($(api_message)) - the rest stay in the cache and are retried within 15 minutes"
-        FAILED=$((FAILED + 1)); UPLOAD_DONE_ALL=no; break ;;
-      401|403)
-        log "Immich refused the upload (HTTP $code: $(api_message)) - check the API key and its permissions"
-        FAILED=$((FAILED + 1)); UPLOAD_DONE_ALL=no; break ;;
-      *)
-        log "Immich didn't accept $key (HTTP $code: $(api_message)) - kept in the cache"
-        FAILED=$((FAILED + 1)); continue ;;
-    esac
-    status=$(jq -r '.status // empty' "$RESP" 2>/dev/null)
-    id=$(jq -r '.id // empty' "$RESP" 2>/dev/null)
+    if [ -z "$id" ]; then
+      # Immich reads the real date and GPS position from the photo itself;
+      # the file's date is only a fallback. deviceAssetId and deviceId are
+      # needed by older versions of Immich, and ignored by newer ones.
+      # --speed-time/--speed-limit give up if nothing is sent for 2 minutes.
+      code=$(api POST /assets -H "x-immich-checksum: $sum" \
+        -F "assetData=@\"$esc\"" \
+        --form-string "deviceAssetId=$key-$size" \
+        --form-string "deviceId=$DEVICE_ID" \
+        --form-string "fileCreatedAt=$when" \
+        --form-string "fileModifiedAt=$when" \
+        --form-string "filename=$(basename "$f")" \
+        --speed-time 120 --speed-limit 1)
+
+      case "$code" in
+        200|201) ;;
+        000)
+          log "lost the connection to Immich ($(api_message)) - the rest stay in the cache and are retried within 15 minutes"
+          FAILED=$((FAILED + 1)); UPLOAD_DONE_ALL=no; break ;;
+        401|403)
+          log "Immich refused the upload (HTTP $code: $(api_message)) - check the API key and its permissions"
+          FAILED=$((FAILED + 1)); UPLOAD_DONE_ALL=no; break ;;
+        *)
+          log "Immich didn't accept $key (HTTP $code: $(api_message)) - kept in the cache"
+          FAILED=$((FAILED + 1)); continue ;;
+      esac
+      status=$(jq -r '.status // empty' "$RESP" 2>/dev/null)
+      id=$(jq -r '.id // empty' "$RESP" 2>/dev/null)
+    fi
     if ! [[ $id =~ ^[A-Za-z0-9-]+$ ]]; then
       log "Immich's reply for $key had no asset ID - kept in the cache"
       FAILED=$((FAILED + 1)); continue
