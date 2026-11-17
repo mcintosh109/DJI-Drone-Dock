@@ -133,6 +133,7 @@ path=\${url#*/api}
 [ "\$(hdr x-api-key)" = "\$(cat "\$I/key")" ] || reply 401 '{"message":"Invalid API key","statusCode":401}'
 case "\$method \$path" in
   "GET /albums")
+    [ -n "\${FAKE_ALBUM_GHOST:-}" ] && reply 200 '[{"id":"ghost-album","albumName":"Drone Photos"}]'
     for f in "\$I"/albums/*.name; do [ -e "\$f" ] || continue
       jq -cn --arg id "\$(basename "\$f" .name)" --arg n "\$(cat "\$f")" '{id:\$id, albumName:\$n}'
     done | jq -cs . > "\$I/out.json"; reply 200 "\$(cat "\$I/out.json")" ;;
@@ -153,6 +154,10 @@ case "\$method \$path" in
     id="asset-\${sum:0:12}"
     printf '%s\n%s\n' "\$id" "\$name" > "\$I/assets/\$sum"
     reply 201 "{\"id\":\"\$id\",\"status\":\"created\"}" ;;
+  GET\ /albums/*)
+    a=\${path#/albums/}
+    [ -e "\$I/albums/\$a.name" ] || reply 400 '{"message":"Album not found","statusCode":400}'
+    reply 200 "{\"id\":\"\$a\",\"albumName\":\"\$(cat "\$I/albums/\$a.name")\"}" ;;
   PUT\ /albums/*/assets)
     [ -n "\${FAKE_ALBUM_FAIL:-}" ] && reply 500 '{"message":"Internal server error"}'
     a=\${path#/albums/}; a=\${a%/assets}
@@ -593,6 +598,28 @@ check "exit 0, without waiting" [ "$code" -eq 0 ]
 check "the log says it's too big" grep -q "because they're too big to fit in the cache on the Pi, even when it's empty" "$T/sync.log"
 check "  ...and it stays on the drone" [ "$(drone_files DJI_014)" -eq 1 ]
 rm -rf "$T/mtp-drone/SD card/DCIM/DJI_014"
+
+echo "An album Immich lists but then can't find"
+media "SD card" DJI_001/DJI_20260601100000_0300_D.JPG
+media "SD card" DJI_001/DJI_20260601100100_0301_D.JPG
+write_conf TESTKEY "Drone Photos" no
+: > "$T/immich/requests"
+FAKE_ALBUM_GHOST=1 bash "$SYNC"; code=$?
+check "exit 1" [ "$code" -eq 1 ]
+check "the log names the album ID and the problem" grep -q "gave the album \"Drone Photos\" the ID ghost-album, but then couldn't open it (HTTP 400: Album not found)" "$T/sync.log"
+check "  ...and nothing was uploaded" bash -c "! grep -q 'POST .*/api/assets' '$T/immich/requests'"
+check "  ...the files stay in the cache" [ "$(cached)" -eq 2 ]
+
+echo "Adding to the album fails: stops after the first file"
+before=$(grep -c "could not add it to the album" "$T/sync.log")
+FAKE_ALBUM_FAIL=1 bash "$SYNC" --flush; code=$?
+check "exit 1" [ "$code" -eq 1 ]
+check "the album error is logged once, not for every file" [ "$(grep -c "could not add it to the album" "$T/sync.log")" -eq $((before + 1)) ]
+check "  ...with the album's ID" grep -q "could not add it to the album \"Drone Photos\" (album ID album-0, HTTP 500" "$T/sync.log"
+check "both files stay in the cache" [ "$(cached)" -eq 2 ]
+bash "$SYNC" --flush
+check "the next run puts them in the album" [ "$(cached)" -eq 0 ]
+check "the log says which album it found" grep -q 'found the album "Drone Photos" in Immich (album ID album-0)' "$T/sync.log"
 
 echo
 echo "$PASSED passed, $FAILED failed"

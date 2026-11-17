@@ -324,8 +324,15 @@ connect_immich() {
       return 1 ;;
   esac
 
+  # The reply must be a list of albums; anything else is shown in the log
+  if [ "$(jq -r 'type' "$RESP" 2>/dev/null)" != array ]; then
+    log "Immich's list of albums wasn't a list - it replied: $(head -c 300 "$RESP" | tr '\n' ' ')"
+    return 1
+  fi
   ALBUM_ID=$(jq -r --arg n "$ALBUM" '[.[] | select(.albumName == $n)][0].id // empty' "$RESP" 2>/dev/null)
-  if [ -z "$ALBUM_ID" ]; then
+  if [ -n "$ALBUM_ID" ]; then
+    log "found the album \"$ALBUM\" in Immich (album ID $ALBUM_ID)"
+  else
     if [ "$MODE" = check ]; then
       log "OK   the album \"$ALBUM\" doesn't exist yet - it will be created on the first upload"
       return 0
@@ -337,11 +344,17 @@ connect_immich() {
       log "could not create the album \"$ALBUM\" in Immich (HTTP $code: $(api_message))"
       return 1
     fi
-    log "created the album \"$ALBUM\" in Immich"
+    log "created the album \"$ALBUM\" in Immich (album ID $ALBUM_ID)"
   fi
   # An ID is used in a web address below, so make sure it's only letters, digits and -
   if ! [[ $ALBUM_ID =~ ^[A-Za-z0-9-]+$ ]]; then
     log "Immich returned an album ID that doesn't look right: $ALBUM_ID"
+    return 1
+  fi
+  # Double-check the album really exists before uploading anything into it
+  code=$(api GET "/albums/$ALBUM_ID" --max-time 60)
+  if [ "$code" != 200 ] || [ "$(jq -r '.id // empty' "$RESP" 2>/dev/null)" != "$ALBUM_ID" ]; then
+    log "Immich gave the album \"$ALBUM\" the ID $ALBUM_ID, but then couldn't open it (HTTP $code: $(api_message)) - nothing uploaded, the files stay in the cache"
     return 1
   fi
   return 0
@@ -696,8 +709,10 @@ upload_cache_now() {
       -H 'Content-Type: application/json' -d "$(jq -cn --arg id "$id" '{ids: [$id]}')")
     ok=$(jq -r '.[0] | (.success == true or .error == "duplicate")' "$RESP" 2>/dev/null)
     if [ "$code" != 200 ] || [ "$ok" != true ]; then
-      log "uploaded $key, but could not add it to the album (HTTP $code: $(api_message)) - kept in the cache, retried later"
-      FAILED=$((FAILED + 1)); continue
+      # An album problem affects every file, so stop here rather than
+      # repeat it for each one. This file and the rest are retried later.
+      log "uploaded $key, but could not add it to the album \"$ALBUM\" (album ID $ALBUM_ID, HTTP $code: $(api_message)) - stopping; this file and the rest stay in the cache, retried later"
+      FAILED=$((FAILED + 1)); UPLOAD_DONE_ALL=no; break
     fi
 
     # Confirmed: remember it (with its checksum), then remove it from the cache
